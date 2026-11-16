@@ -1,84 +1,71 @@
+// Eyemail inbound mail worker
+// Receives mail from Cloudflare Email Routing and hands it to the backend,
+// which owns the mailbox lookup, storage accounting and Firestore write.
+//
+// Required Cloudflare environment variables:
+//   BACKEND_URL      e.g. https://eyemail-backend.onrender.com
+//   WEBHOOK_SECRET   must match WEBHOOK_SECRET in Render
+//
+// Deployed by hand in the Cloudflare dashboard (Email Routing -> Email Workers).
+// A merge to this repository does not publish it.
+
+const MAX_BODY_CHARS = 15000;
+
 export default {
   async email(message, env, ctx) {
+    const toAddress = (message.to || "").toLowerCase().trim();
+    const fromAddress = (message.from || "").trim();
+    const subject = message.headers.get("subject") || "(No Subject)";
+
+    if (!toAddress.endsWith("@eyemail.in")) {
+      message.setReject("Invalid domain");
+      return;
+    }
+
+    if (!env.BACKEND_URL || !env.WEBHOOK_SECRET) {
+      // Misconfigured worker: defer the message instead of losing it.
+      throw new Error("Worker is missing BACKEND_URL or WEBHOOK_SECRET");
+    }
+
+    const rawEmail = await new Response(message.raw).text();
+    const bodyText = extractPlainText(rawEmail);
+
+    let resp;
     try {
-      const toAddress = (message.to || "").toLowerCase().trim();
-      const fromAddress = (message.from || "").trim();
-      const subject = message.headers.get("subject") || "(No Subject)";
-
-      if (!toAddress.endsWith("@eyemail.in")) {
-        message.setReject("Invalid domain");
-        return;
-      }
-
-      const username = toAddress.split("@")[0].replace(/[^a-z0-9._-]/g, "");
-      if (!username) {
-        message.setReject("Invalid recipient");
-        return;
-      }
-
-      const rawEmail = await new Response(message.raw).text();
-      const bodyText = extractPlainText(rawEmail);
-      const snippet = bodyText.replace(/\s+/g, " ").trim().slice(0, 120);
-
-      const accessToken = await getGoogleAccessToken(
-        env.FIREBASE_CLIENT_EMAIL,
-        env.FIREBASE_PRIVATE_KEY
-      );
-
-      const projectId = env.FIREBASE_PROJECT_ID;
-      const baseUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents`;
-
-      const userLookupResp = await fetch(`${baseUrl}/usernames/${username}`, {
-        headers: { Authorization: `Bearer ${accessToken}` },
-      });
-
-      if (!userLookupResp.ok) {
-        message.setReject("Mailbox does not exist");
-        return;
-      }
-
-      const userLookupData = await userLookupResp.json();
-      const targetUid = userLookupData.fields?.uid?.stringValue;
-
-      if (!targetUid) {
-        message.setReject("User UID not found");
-        return;
-      }
-
-      const nowIso = new Date().toISOString();
-      const firestoreDoc = {
-        fields: {
-          from: { stringValue: fromAddress },
-          fromName: { stringValue: fromAddress.split("@")[0] },
-          to: { stringValue: toAddress },
-          subject: { stringValue: subject },
-          body: { stringValue: bodyText || "(Empty message body)" },
-          snippet: { stringValue: snippet },
-          folder: { stringValue: "inbox" },
-          read: { booleanValue: false },
-          starred: { booleanValue: false },
-          timestamp: { timestampValue: nowIso },
-          createdAt: { stringValue: nowIso },
-        },
-      };
-
-      await fetch(`${baseUrl}/users/${targetUid}/emails`, {
+      resp = await fetch(`${env.BACKEND_URL.replace(/\/+$/, "")}/webhook/inbound`, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${accessToken}`,
           "Content-Type": "application/json",
+          "x-webhook-secret": env.WEBHOOK_SECRET,
         },
-        body: JSON.stringify(firestoreDoc),
+        body: JSON.stringify({
+          from: fromAddress,
+          to: toAddress,
+          subject: subject,
+          text: bodyText,
+        }),
       });
     } catch (err) {
-      console.error("Email worker error:", err);
+      // Backend unreachable (cold start, network). Defer so Cloudflare retries.
+      throw new Error(`Backend unreachable: ${err}`);
     }
+
+    if (resp.ok) return;
+
+    if (resp.status === 404) {
+      // Mailbox really does not exist - bounce it so the sender knows.
+      message.setReject("Mailbox does not exist");
+      return;
+    }
+
+    const detail = await resp.text();
+    throw new Error(`Backend rejected inbound mail (${resp.status}): ${detail}`);
   },
 };
 
 function extractPlainText(raw) {
   const parts = raw.split(/\r?\n\r?\n/);
-  if (parts.length < 2) return raw.slice(0, 4000);
+  if (parts.length < 2) return raw.slice(0, MAX_BODY_CHARS);
   let body = parts.slice(1).join("\n\n");
 
   const boundaryMatch = raw.match(/boundary="?([^"\r\n;]+)"?/i);
@@ -97,56 +84,5 @@ function extractPlainText(raw) {
   }
 
   body = body.replace(/=\r?\n/g, "").replace(/=20/g, " ").replace(/=3D/g, "=");
-  return body.trim().slice(0, 15000);
-}
-
-async function getGoogleAccessToken(clientEmail, privateKeyPem) {
-  const header = { alg: "RS256", typ: "JWT" };
-  const now = Math.floor(Date.now() / 1000);
-  const claim = {
-    iss: clientEmail,
-    scope: "https://www.googleapis.com/auth/datastore",
-    aud: "https://oauth2.googleapis.com/token",
-    exp: now + 3600,
-    iat: now,
-  };
-
-  const encode = (obj) =>
-    btoa(JSON.stringify(obj)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-
-  const unsignedJwt = `${encode(header)}.${encode(claim)}`;
-  const cleanPem = privateKeyPem
-    .replace(/\\n/g, "\n")
-    .replace("-----BEGIN PRIVATE KEY-----", "")
-    .replace("-----END PRIVATE KEY-----", "")
-    .replace(/\s+/g, "");
-
-  const binaryKey = Uint8Array.from(atob(cleanPem), (c) => c.charCodeAt(0));
-  const cryptoKey = await crypto.subtle.importKey(
-    "pkcs8",
-    binaryKey,
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-
-  const signature = await crypto.subtle.sign(
-    "RSASSA-PKCS1-v1_5",
-    cryptoKey,
-    new TextEncoder().encode(unsignedJwt)
-  );
-
-  const signedJwt = `${unsignedJwt}.${btoa(String.fromCharCode(...new Uint8Array(signature)))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "")}`;
-
-  const tokenResp = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${signedJwt}`,
-  });
-
-  const tokenData = await tokenResp.json();
-  return tokenData.access_token;
+  return body.trim().slice(0, MAX_BODY_CHARS);
 }
