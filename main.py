@@ -59,6 +59,8 @@ FREE_STORAGE_LIMIT_BYTES = 1 * 1024 * 1024 * 1024  # 1 GB Free Storage
 FREE_DAILY_EXTERNAL_LIMIT = int(os.environ.get("DAILY_EXTERNAL_LIMIT", "50"))
 PAID_DAILY_EXTERNAL_LIMIT = 500
 OTP_EXPIRY_SECONDS = 300  # 5 minutes
+SIGNUP_OTP_EXPIRY_SECONDS = 600  # 10 minutes to enter the signup code
+SIGNUP_VERIFIED_TTL_SECONDS = 900  # 15 minutes to finish registration after verifying
 
 RESERVED_USERNAMES = {
     "admin", "administrator", "support", "help", "info", "contact",
@@ -74,6 +76,14 @@ class RegisterMailboxRequest(BaseModel):
 
 
 class VerifyLoginOtpRequest(BaseModel):
+    otp: str
+
+
+class SignupOtpRequest(BaseModel):
+    recovery_email: EmailStr
+
+
+class VerifySignupOtpRequest(BaseModel):
     otp: str
 
 
@@ -202,6 +212,16 @@ def register_mailbox(payload: RegisterMailboxRequest, user=Depends(verify_fireba
     if existing_user:
         return {"status": "exists", "profile": existing_user}
 
+    # The recovery address must be proven before the mailbox is created.
+    verified = rtdb.reference(f"signup_verified/{uid}").get()
+    if not verified:
+        raise HTTPException(status_code=403, detail="Verify your recovery email first.")
+    if int(time.time()) > int(verified.get("expiresAt", 0)):
+        rtdb.reference(f"signup_verified/{uid}").delete()
+        raise HTTPException(status_code=403, detail="Verification expired. Please verify again.")
+    if (verified.get("recoveryEmail") or "").lower() != recovery_email:
+        raise HTTPException(status_code=400, detail="Recovery email does not match the one you verified.")
+
     username_ref = rtdb.reference(f"usernames/{safe_user}")
     if username_ref.get() is not None:
         raise HTTPException(status_code=409, detail=f"{eyemail_address} is already taken.")
@@ -221,6 +241,7 @@ def register_mailbox(payload: RegisterMailboxRequest, user=Depends(verify_fireba
         "username": username,
         "email": eyemail_address,
         "recoveryEmail": recovery_email,
+        "recoveryVerified": True,
         "plan": "free",
         "storageUsedBytes": 512,
         "storageLimitBytes": FREE_STORAGE_LIMIT_BYTES,
@@ -248,6 +269,8 @@ def register_mailbox(payload: RegisterMailboxRequest, user=Depends(verify_fireba
         "createdAt": now_iso,
     })
 
+    rtdb.reference(f"signup_verified/{uid}").delete()
+
     return {"status": "created", "profile": profile_data}
 
 
@@ -261,7 +284,85 @@ def get_user_profile(user=Depends(verify_firebase_user)):
 
 
 # ==============================================================================
-# 2. MANDATORY LOGIN 2FA OTP (Stored in Realtime Database, Sent to Recovery Email)
+# 1b. SIGNUP: VERIFY THE RECOVERY EMAIL BEFORE THE MAILBOX IS CREATED
+# ==============================================================================
+@app.post("/api/auth/send-signup-otp")
+def send_signup_otp(payload: SignupOtpRequest, user=Depends(verify_firebase_user)):
+    uid = user["uid"]
+
+    if rtdb.reference(f"users/{uid}").get():
+        raise HTTPException(status_code=409, detail="This account is already registered. Please sign in.")
+
+    recovery_email = payload.recovery_email.strip().lower()
+    otp_ref = rtdb.reference(f"signup_otps/{uid}")
+    previous = otp_ref.get() or {}
+    now = int(time.time())
+
+    last_sent = int(previous.get("sentAt", 0))
+    if last_sent and now - last_sent < 60:
+        raise HTTPException(status_code=429, detail=f"Please wait {60 - (now - last_sent)}s before asking for another code.")
+
+    otp_code = f"{secrets.randbelow(900000) + 100000}"
+    otp_ref.set({
+        "otp": otp_code,
+        "recoveryEmail": recovery_email,
+        "expiresAt": now + SIGNUP_OTP_EXPIRY_SECONDS,
+        "attempts": 0,
+        "sentAt": now,
+    })
+
+    body = (
+        f"Welcome to Eyemail.\n\n"
+        f"Your verification code is:\n\n"
+        f"{otp_code}\n\n"
+        f"Enter it on the signup page to activate your mailbox. It expires in 10 minutes.\n\n"
+        f"— Team Eyemail"
+    )
+    send_via_brevo("Eyemail", f"security@{DOMAIN_NAME}", recovery_email,
+                   f"{otp_code} is your Eyemail verification code", body)
+
+    return {
+        "status": "otp_sent",
+        "maskedRecoveryEmail": mask_email(recovery_email),
+        "expiresInSeconds": SIGNUP_OTP_EXPIRY_SECONDS,
+    }
+
+
+@app.post("/api/auth/verify-signup-otp")
+def verify_signup_otp(payload: VerifySignupOtpRequest, user=Depends(verify_firebase_user)):
+    uid = user["uid"]
+    entered = payload.otp.strip()
+    otp_ref = rtdb.reference(f"signup_otps/{uid}")
+    record = otp_ref.get()
+
+    if not record:
+        raise HTTPException(status_code=400, detail="No active code found. Please request a new one.")
+    if int(time.time()) > int(record.get("expiresAt", 0)):
+        otp_ref.delete()
+        raise HTTPException(status_code=400, detail="Code expired. Please request a new one.")
+
+    attempts = int(record.get("attempts", 0))
+    if attempts >= 5:
+        otp_ref.delete()
+        raise HTTPException(status_code=429, detail="Too many wrong attempts. Request a new code.")
+
+    if not secrets.compare_digest(entered, str(record.get("otp", ""))):
+        otp_ref.update({"attempts": attempts + 1})
+        raise HTTPException(status_code=400, detail="That code is not correct.")
+
+    now = int(time.time())
+    rtdb.reference(f"signup_verified/{uid}").set({
+        "recoveryEmail": record.get("recoveryEmail", ""),
+        "verifiedAt": now,
+        "expiresAt": now + SIGNUP_VERIFIED_TTL_SECONDS,
+    })
+    otp_ref.delete()
+
+    return {"status": "verified", "expiresInSeconds": SIGNUP_VERIFIED_TTL_SECONDS}
+
+
+# ==============================================================================
+# 2. OPTIONAL LOGIN 2FA OTP (kept for later use, not required to sign in)
 # ==============================================================================
 @app.post("/api/auth/send-login-otp")
 def send_login_otp(user=Depends(verify_firebase_user)):
