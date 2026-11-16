@@ -9,7 +9,8 @@ from email.utils import parseaddr
 from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
+from typing import List
+from pydantic import BaseModel, EmailStr, Field
 import requests
 import firebase_admin
 from firebase_admin import credentials, auth, firestore, db as rtdb
@@ -88,6 +89,8 @@ class SendEmailRequest(BaseModel):
     to: EmailStr
     subject: str
     body: str
+    cc: List[EmailStr] = Field(default_factory=list)
+    bcc: List[EmailStr] = Field(default_factory=list)
 
 
 class InternalSendMailRequest(BaseModel):
@@ -131,7 +134,8 @@ def rtdb_safe_key(text: str) -> str:
     return text.strip().lower().replace(".", ",")
 
 
-def send_via_brevo(sender_name: str, sender_email: str, to_email: str, subject: str, body: str):
+def send_via_brevo(sender_name: str, sender_email: str, to_email: str, subject: str, body: str,
+                   cc: List[str] | None = None, bcc: List[str] | None = None):
     if not BREVO_API_KEY:
         raise HTTPException(status_code=500, detail="BREVO_API_KEY is not configured on server.")
     brevo_payload = {
@@ -140,6 +144,10 @@ def send_via_brevo(sender_name: str, sender_email: str, to_email: str, subject: 
         "subject": subject,
         "textContent": body,
     }
+    if cc:
+        brevo_payload["cc"] = [{"email": addr} for addr in cc]
+    if bcc:
+        brevo_payload["bcc"] = [{"email": addr} for addr in bcc]
     headers = {
         "accept": "application/json",
         "api-key": BREVO_API_KEY,
@@ -420,57 +428,70 @@ def send_email(payload: SendEmailRequest, user=Depends(verify_firebase_user)):
     if not body:
         raise HTTPException(status_code=400, detail="Email body cannot be empty")
 
+    # Cc and Bcc, cleaned, de-duplicated and never the sender itself
+    def clean_addrs(items):
+        out, seen = [], set()
+        for raw in items:
+            addr = str(raw).strip().lower()
+            if not addr or addr in seen or addr == sender_email:
+                continue
+            seen.add(addr)
+            out.append(addr)
+        return out
+
+    cc_list = clean_addrs(payload.cc)
+    bcc_list = clean_addrs(payload.bcc)
+    if to_email in cc_list or to_email in bcc_list:
+        cc_list = [a for a in cc_list if a != to_email]
+        bcc_list = [a for a in bcc_list if a != to_email]
+
+    all_recipients = [to_email] + cc_list + bcc_list
+    if len(all_recipients) > 20:
+        raise HTTPException(status_code=400, detail="Too many recipients (max 20).")
+
     now_iso = datetime.now(timezone.utc).isoformat()
     snippet = re.sub(r"\s+", " ", body)[:120]
     msg_size = len(body.encode("utf-8")) + len(subject.encode("utf-8")) + 256
 
-    # CASE A: Internal @eyemail.in -> @eyemail.in (Unlimited Free)
-    if to_email.endswith(f"@{DOMAIN_NAME}"):
-        target_username = rtdb_safe_key(to_email.split("@")[0])
-        username_data = rtdb.reference(f"usernames/{target_username}").get()
-
-        if not username_data:
-            raise HTTPException(status_code=404, detail=f"Address {to_email} does not exist.")
-
-        target_uid = username_data.get("uid")
-        target_user_ref = rtdb.reference(f"users/{target_uid}")
-        target_used = int((target_user_ref.get() or {}).get("storageUsedBytes", 0))
-
-        # Store inbox copy in Firestore
-        fs_db.collection("users").document(target_uid).collection("emails").add({
+    def store_message(owner_uid: str, folder: str, is_read: bool, recipient: str):
+        fs_db.collection("users").document(owner_uid).collection("emails").add({
             "from": sender_email,
             "fromName": sender_name,
-            "to": to_email,
+            "to": recipient,
+            "cc": cc_list,
+            "bcc": bcc_list if folder == "sent" else [],
             "subject": subject,
             "body": body,
             "snippet": snippet,
-            "folder": "inbox",
-            "read": False,
+            "folder": folder,
+            "read": is_read,
             "starred": False,
             "timestamp": firestore.SERVER_TIMESTAMP,
             "createdAt": now_iso,
         })
-        target_user_ref.update({"storageUsedBytes": target_used + msg_size})
 
-        # Store sent copy in Firestore
-        fs_db.collection("users").document(uid).collection("emails").add({
-            "from": sender_email,
-            "fromName": sender_name,
-            "to": to_email,
-            "subject": subject,
-            "body": body,
-            "snippet": snippet,
-            "folder": "sent",
-            "read": True,
-            "starred": False,
-            "timestamp": firestore.SERVER_TIMESTAMP,
-            "createdAt": now_iso,
-        })
+    # CASE A: every recipient is @eyemail.in -> deliver inside, no Brevo call
+    if all(addr.endswith(f"@{DOMAIN_NAME}") for addr in all_recipients):
+        for addr in all_recipients:
+            target_username = rtdb_safe_key(addr.split("@")[0])
+            username_data = rtdb.reference(f"usernames/{target_username}").get()
+            if not username_data:
+                raise HTTPException(status_code=404, detail=f"Address {addr} does not exist.")
+
+            target_uid = username_data.get("uid")
+            target_user_ref = rtdb.reference(f"users/{target_uid}")
+            target_used = int((target_user_ref.get() or {}).get("storageUsedBytes", 0))
+
+            store_message(target_uid, "inbox", False, addr)
+            target_user_ref.update({"storageUsedBytes": target_used + msg_size})
+
+        store_message(uid, "sent", True, to_email)
         user_ref.update({"storageUsedBytes": current_used + msg_size})
 
-        return {"status": "sent", "delivery": "internal", "to": to_email}
+        return {"status": "sent", "delivery": "internal", "to": to_email,
+                "cc": cc_list, "bcc": bcc_list}
 
-    # CASE B: External Email via Brevo API
+    # CASE B: at least one external recipient -> Brevo
     daily_limit = PAID_DAILY_EXTERNAL_LIMIT if user_plan != "free" else FREE_DAILY_EXTERNAL_LIMIT
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     usage_ref = rtdb.reference(f"usage/{uid}/{today_str}")
@@ -482,25 +503,14 @@ def send_email(payload: SendEmailRequest, user=Depends(verify_firebase_user)):
             detail=f"Daily external limit ({daily_limit} emails/day) reached."
         )
 
-    send_via_brevo(sender_name, sender_email, to_email, subject, body)
+    send_via_brevo(sender_name, sender_email, to_email, subject, body, cc=cc_list, bcc=bcc_list)
     usage_ref.update({"externalSent": sent_today + 1})
 
-    fs_db.collection("users").document(uid).collection("emails").add({
-        "from": sender_email,
-        "fromName": sender_name,
-        "to": to_email,
-        "subject": subject,
-        "body": body,
-        "snippet": snippet,
-        "folder": "sent",
-        "read": True,
-        "starred": False,
-        "timestamp": firestore.SERVER_TIMESTAMP,
-        "createdAt": now_iso,
-    })
+    store_message(uid, "sent", True, to_email)
     user_ref.update({"storageUsedBytes": current_used + msg_size})
 
-    return {"status": "sent", "delivery": "brevo", "to": to_email}
+    return {"status": "sent", "delivery": "brevo", "to": to_email,
+            "cc": cc_list, "bcc": bcc_list}
 
 
 # ==============================================================================
