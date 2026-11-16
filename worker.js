@@ -2,9 +2,9 @@
 // Receives mail from Cloudflare Email Routing and hands it to the backend,
 // which owns the mailbox lookup, storage accounting and Firestore write.
 //
-// Required Cloudflare environment variables:
-//   BACKEND_URL      e.g. https://eyemail-backend.onrender.com
+// Required Cloudflare environment variable:
 //   WEBHOOK_SECRET   must match WEBHOOK_SECRET in Render
+// BACKEND_URL is optional - it defaults to the Render service below.
 //
 // Deployed by hand in the Cloudflare dashboard (Email Routing -> Email Workers).
 // A merge to this repository does not publish it.
@@ -22,9 +22,13 @@ export default {
       return;
     }
 
-    if (!env.BACKEND_URL || !env.WEBHOOK_SECRET) {
+    // BACKEND_URL is not a secret, so it has a safe default and you do not
+    // have to type it in the dashboard.
+    const backendUrl = (env.BACKEND_URL || "https://eyemail-backend.onrender.com").replace(/\/+$/, "");
+
+    if (!env.WEBHOOK_SECRET) {
       // Misconfigured worker: defer the message instead of losing it.
-      throw new Error("Worker is missing BACKEND_URL or WEBHOOK_SECRET");
+      throw new Error("Worker is missing WEBHOOK_SECRET");
     }
 
     const rawEmail = await new Response(message.raw).text();
@@ -32,7 +36,7 @@ export default {
 
     let resp;
     try {
-      resp = await fetch(`${env.BACKEND_URL.replace(/\/+$/, "")}/webhook/inbound`, {
+      resp = await fetch(`${backendUrl}/webhook/inbound`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
