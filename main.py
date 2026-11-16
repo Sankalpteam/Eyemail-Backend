@@ -103,6 +103,10 @@ class SendEmailRequest(BaseModel):
     bcc: List[EmailStr] = Field(default_factory=list)
 
 
+class DeleteMessagesRequest(BaseModel):
+    ids: List[str]
+
+
 class InternalSendMailRequest(BaseModel):
     to: EmailStr
     subject: str
@@ -612,6 +616,42 @@ def send_email(payload: SendEmailRequest, user=Depends(verify_firebase_user)):
 
     return {"status": "sent", "delivery": "brevo", "to": to_email,
             "cc": cc_list, "bcc": bcc_list}
+
+
+# ==============================================================================
+# 5b. PERMANENT DELETE (server side, frees the storage counter too)
+# ==============================================================================
+@app.post("/api/messages/delete")
+def delete_messages(payload: DeleteMessagesRequest, user=Depends(verify_firebase_user)):
+    uid = user["uid"]
+    ids = [str(i).strip() for i in payload.ids if str(i).strip()]
+
+    if not ids:
+        raise HTTPException(status_code=400, detail="No messages selected.")
+    if len(ids) > 100:
+        raise HTTPException(status_code=400, detail="Delete at most 100 messages at a time.")
+
+    coll = fs_db.collection("users").document(uid).collection("emails")
+    freed = 0
+    deleted = 0
+
+    for message_id in ids:
+        ref = coll.document(message_id)
+        snapshot = ref.get()
+        if not snapshot.exists:
+            continue
+        data = snapshot.to_dict() or {}
+        freed += len((data.get("body") or "").encode("utf-8"))
+        freed += len((data.get("subject") or "").encode("utf-8")) + 256
+        ref.delete()
+        deleted += 1
+
+    if freed:
+        user_ref = rtdb.reference(f"users/{uid}")
+        used = int((user_ref.get() or {}).get("storageUsedBytes", 0))
+        user_ref.update({"storageUsedBytes": max(0, used - freed)})
+
+    return {"status": "deleted", "deleted": deleted, "freedBytes": freed}
 
 
 # ==============================================================================
