@@ -257,6 +257,13 @@ def count_daily(path: str, daily_limit: int) -> int:
     return 0
 
 
+def storage_state(profile: dict) -> tuple:
+    """(used, limit, is_full) for a profile node."""
+    used = int((profile or {}).get("storageUsedBytes", 0) or 0)
+    limit = int((profile or {}).get("storageLimitBytes", FREE_STORAGE_LIMIT_BYTES) or FREE_STORAGE_LIMIT_BYTES)
+    return used, limit, used >= limit
+
+
 def mask_email(addr: str) -> str:
     if "@" not in addr:
         return addr
@@ -739,6 +746,13 @@ def send_email(payload: SendEmailRequest, user=Depends(verify_firebase_user)):
             "createdAt": now_iso,
         })
 
+    sender_used, sender_limit, sender_full = storage_state(user_data)
+    if sender_full:
+        raise HTTPException(
+            status_code=507,
+            detail="Your mailbox is full. Empty Trash or delete some mail to send again.",
+        )
+
     # CASE A: every recipient is @eyemail.in -> deliver inside, no Brevo call
     if all(addr.endswith(f"@{DOMAIN_NAME}") for addr in all_recipients):
         for addr in all_recipients:
@@ -909,7 +923,12 @@ async def inbound_email_webhook(request: Request, x_webhook_secret: str = Header
         raise HTTPException(status_code=404, detail=f"Mailbox {to_email} does not exist")
 
     target_user_ref = rtdb.reference(f"users/{user_node(target_uid)}")
-    target_used = int((target_user_ref.get() or {}).get("storageUsedBytes", 0))
+    target_profile = target_user_ref.get() or {}
+    _used, _limit, target_full = storage_state(target_profile)
+    if target_full:
+        # The sender is told the mailbox is full instead of losing the mail quietly.
+        raise HTTPException(status_code=507, detail=f"Mailbox {to_email} is full.")
+    target_used = int(target_profile.get("storageUsedBytes", 0) or 0)
 
     now_iso = datetime.now(timezone.utc).isoformat()
     snippet = re.sub(r"\s+", " ", body)[:120]
@@ -954,6 +973,11 @@ def internal_send_mail(payload: InternalSendMailRequest, _=Depends(verify_intern
         target_uid = resolve_uid(rtdb.reference(f"usernames/{username}").get())
         if not target_uid:
             raise HTTPException(status_code=404, detail="Eyemail recipient does not exist")
+
+        target_profile = rtdb.reference(f"users/{user_node(target_uid)}").get() or {}
+        _used, _limit, target_full = storage_state(target_profile)
+        if target_full:
+            raise HTTPException(status_code=507, detail="Recipient mailbox is full.")
         fs_db.collection("users").document(target_uid).collection("emails").add({
             "from": f"noreply@{DOMAIN_NAME}",
             "fromName": sender_name,
