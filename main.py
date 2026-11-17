@@ -107,6 +107,14 @@ class DeleteMessagesRequest(BaseModel):
     ids: List[str]
 
 
+class RecoveryEmailRequest(BaseModel):
+    recovery_email: EmailStr
+
+
+class OtpOnlyRequest(BaseModel):
+    otp: str
+
+
 class PublicSignupRequest(BaseModel):
     username: str
     name: str = ""
@@ -414,9 +422,33 @@ def register_mailbox(payload: RegisterMailboxRequest, user=Depends(verify_fireba
     return {"status": "created", "profile": profile_data}
 
 
+def purge_old_trash(uid: str, days: int = 30, max_docs: int = 25) -> int:
+    """Delete Trash mail older than `days`. Runs a slice at a time, on read."""
+    cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
+    removed = 0
+    try:
+        coll = fs_db.collection("users").document(uid).collection("emails")
+        for doc in coll.where("folder", "==", "trash").stream():
+            data = doc.to_dict() or {}
+            stamp = data.get("createdAt") or ""
+            try:
+                when = datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+            except Exception:
+                continue
+            if when < cutoff:
+                doc.reference.delete()
+                removed += 1
+                if removed >= max_docs:
+                    break
+    except Exception as error:
+        print(f"[trash] purge skipped for {uid}: {error}", flush=True)
+    return removed
+
+
 @app.get("/api/user/profile")
 def get_user_profile(user=Depends(verify_firebase_user)):
     uid = user["uid"]
+    purge_old_trash(uid)
     profile = rtdb.reference(f"users/{user_node(uid)}").get()
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found in Realtime Database")
@@ -650,6 +682,118 @@ def verify_login_otp(payload: VerifyLoginOtpRequest, user=Depends(verify_firebas
     otp_ref.delete()
     rtdb.reference(f"users/{user_node(uid)}/lastLoginAt").set(datetime.now(timezone.utc).isoformat())
     return {"status": "verified"}
+
+
+# ==============================================================================
+# 2b. SETTINGS: CHANGE THE RECOVERY EMAIL, SIGN OUT EVERYWHERE, DELETE THE ACCOUNT
+# ==============================================================================
+@app.post("/api/auth/send-recovery-otp")
+def send_recovery_otp(payload: RecoveryEmailRequest, user=Depends(verify_firebase_user)):
+    """Mail a code to the new recovery address before we believe it."""
+    uid = user["uid"]
+    profile = rtdb.reference(f"users/{user_node(uid)}").get()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Mailbox not found.")
+
+    new_email = payload.recovery_email.strip().lower()
+    if new_email == (profile.get("recoveryEmail") or "").strip().lower():
+        raise HTTPException(status_code=400, detail="That is already your recovery email.")
+
+    take_slot(f"limits/recovery/{user_node(uid)}", max_count=3, window_seconds=3600)
+
+    now = int(time.time())
+    code = f"{secrets.randbelow(900000) + 100000}"
+    rtdb.reference(f"recovery_otps/{user_node(uid)}").set({
+        "otp": code, "recoveryEmail": new_email,
+        "expiresAt": now + SIGNUP_OTP_EXPIRY_SECONDS, "attempts": 0,
+    })
+
+    body = (
+        f"Confirm this address for your Eyemail account.\n\n"
+        f"Your code is:\n\n{code}\n\n"
+        f"It expires in 10 minutes. If you did not ask for this, ignore this mail.\n\n"
+        f"— Team Eyemail"
+    )
+    send_via_brevo("Eyemail", f"security@{DOMAIN_NAME}", new_email,
+                   f"{code} is your Eyemail confirmation code", body)
+
+    return {"status": "otp_sent", "maskedRecoveryEmail": mask_email(new_email),
+            "expiresInSeconds": SIGNUP_OTP_EXPIRY_SECONDS}
+
+
+@app.post("/api/auth/verify-recovery-otp")
+def verify_recovery_otp(payload: OtpOnlyRequest, user=Depends(verify_firebase_user)):
+    uid = user["uid"]
+    ref = rtdb.reference(f"recovery_otps/{user_node(uid)}")
+    record = ref.get() or {}
+    if not record:
+        raise HTTPException(status_code=400, detail="Ask for a code first.")
+    if int(time.time()) > int(record.get("expiresAt", 0)):
+        ref.delete()
+        raise HTTPException(status_code=400, detail="That code has expired. Ask for a new one.")
+
+    attempts = int(record.get("attempts", 0))
+    if attempts >= 5:
+        ref.delete()
+        raise HTTPException(status_code=429, detail="Too many wrong codes. Ask for a new one.")
+
+    if not secrets.compare_digest(str(payload.otp).strip(), str(record.get("otp", ""))):
+        ref.update({"attempts": attempts + 1})
+        raise HTTPException(status_code=400, detail="That code is not correct.")
+
+    new_email = record.get("recoveryEmail")
+    rtdb.reference(f"users/{user_node(uid)}").update({
+        "recoveryEmail": new_email,
+        "recoveryVerified": True,
+    })
+    ref.delete()
+    return {"status": "updated", "recoveryEmail": new_email}
+
+
+@app.post("/api/auth/sign-out-all")
+def sign_out_all(user=Depends(verify_firebase_user)):
+    """Revoke every refresh token; each device must sign in again."""
+    uid = user["uid"]
+    try:
+        auth.revoke_refresh_tokens(uid)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Could not end the other sessions.")
+    return {"status": "signed_out_all"}
+
+
+@app.post("/api/auth/delete-account")
+def delete_account(user=Depends(verify_firebase_user)):
+    """Remove the mailbox, its mail, its address and the login. Not reversible."""
+    uid = user["uid"]
+    profile = rtdb.reference(f"users/{user_node(uid)}").get()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Mailbox not found.")
+
+    username = (profile.get("username") or profile.get("email", "").split("@")[0] or "").lower()
+
+    deleted = 0
+    try:
+        coll = fs_db.collection("users").document(uid).collection("emails")
+        for doc in coll.stream():
+            doc.reference.delete()
+            deleted += 1
+    except Exception as error:
+        print(f"[account] mail delete failed uid={uid} {error}", flush=True)
+        raise HTTPException(status_code=500, detail="Mail could not be deleted. Nothing was removed.")
+
+    try:
+        auth.delete_user(uid)
+    except auth.UserNotFoundError:
+        pass
+    except Exception:
+        raise HTTPException(status_code=500, detail="The login could not be removed.")
+
+    if username:
+        rtdb.reference(f"usernames/{rtdb_safe_key(username)}").delete()
+    rtdb.reference(f"users/{user_node(uid)}").delete()
+    rtdb.reference(f"signup_verified/{user_node(uid)}").delete()
+
+    return {"status": "deleted", "messages": deleted}
 
 
 # ==============================================================================
