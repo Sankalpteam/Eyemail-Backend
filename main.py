@@ -194,6 +194,69 @@ def send_via_brevo(sender_name: str, sender_email: str, to_email: str, subject: 
         raise HTTPException(status_code=502, detail=f"Brevo delivery failed: {resp.text}")
 
 
+class RateLimited(Exception):
+    """Raised inside a transaction to abort a write when a limit is reached."""
+
+    def __init__(self, retry_after_seconds: int):
+        self.retry_after_seconds = max(1, int(retry_after_seconds))
+        super().__init__("rate limited")
+
+
+def take_slot(path: str, max_count: int, window_seconds: int) -> None:
+    """Count one request in the current window, atomically, or refuse it.
+
+    The counter lives at `path` as {windowStart, count}. The transaction is what
+    makes it safe: two requests arriving together cannot both read the same
+    count and both write count+1.
+    """
+    now = int(time.time())
+    window_start = now - (now % window_seconds)
+    ref = rtdb.reference(path)
+
+    def bump(current):
+        current = current or {}
+        if int(current.get("windowStart", 0)) != window_start:
+            return {"windowStart": window_start, "count": 1}
+        count = int(current.get("count", 0))
+        if count >= max_count:
+            raise RateLimited(window_start + window_seconds - now)
+        return {"windowStart": window_start, "count": count + 1}
+
+    try:
+        ref.transaction(bump)
+    except RateLimited as limited:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many requests. Try again in {limited.retry_after_seconds}s.",
+        )
+    except Exception:
+        # A counter that cannot be written must not take the service down.
+        print(f"[limit] could not record {path}", flush=True)
+
+
+def count_daily(path: str, daily_limit: int) -> int:
+    """Add one to today's counter, or refuse when the day is full."""
+    ref = rtdb.reference(path)
+
+    def bump(current):
+        current = current or {}
+        used = int(current.get("externalSent", 0))
+        if used >= daily_limit:
+            raise RateLimited(60)
+        return {"externalSent": used + 1}
+
+    try:
+        ref.transaction(bump)
+    except RateLimited:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Daily external limit ({daily_limit} emails/day) reached.",
+        )
+    except Exception:
+        print(f"[limit] could not record {path}", flush=True)
+    return 0
+
+
 def mask_email(addr: str) -> str:
     if "@" not in addr:
         return addr
@@ -404,6 +467,7 @@ def send_signup_otp(payload: SignupOtpRequest, user=Depends(verify_firebase_user
     last_sent = int(previous.get("sentAt", 0))
     if last_sent and now - last_sent < 60:
         raise HTTPException(status_code=429, detail=f"Please wait {60 - (now - last_sent)}s before asking for another code.")
+    take_slot(f"limits/otp/{user_node(uid)}", max_count=10, window_seconds=3600)
 
     otp_code = f"{secrets.randbelow(900000) + 100000}"
     otp_ref.set({
@@ -548,6 +612,8 @@ def forgot_password(payload: ForgotPasswordRequest):
     uid = resolve_uid(rtdb.reference(f"usernames/{safe_user}").get())
     if not uid:
         raise HTTPException(status_code=404, detail=f"No Eyemail account found for {eyemail_address}")
+
+    take_slot(f"limits/forgot/{user_node(uid)}", max_count=3, window_seconds=3600)
 
     profile = rtdb.reference(f"users/{user_node(uid)}").get() or {}
     recovery_email = (profile.get("recoveryEmail") or "").strip().lower()
@@ -696,17 +762,11 @@ def send_email(payload: SendEmailRequest, user=Depends(verify_firebase_user)):
     # CASE B: at least one external recipient -> Brevo
     daily_limit = PAID_DAILY_EXTERNAL_LIMIT if user_plan != "free" else FREE_DAILY_EXTERNAL_LIMIT
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    usage_ref = rtdb.reference(f"usage/{user_node(uid)}/{today_str}")
-    sent_today = int((usage_ref.get() or {}).get("externalSent", 0))
-
-    if sent_today >= daily_limit:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Daily external limit ({daily_limit} emails/day) reached."
-        )
+    # One person cannot send faster than this, whatever the daily allowance.
+    take_slot(f"limits/send/{user_node(uid)}", max_count=30, window_seconds=60)
+    count_daily(f"usage/{user_node(uid)}/{today_str}", daily_limit)
 
     send_via_brevo(sender_name, sender_email, to_email, subject, body, cc=cc_list, bcc=bcc_list)
-    usage_ref.update({"externalSent": sent_today + 1})
 
     store_message(uid, "sent", True, to_email)
     user_ref.update({"storageUsedBytes": current_used + msg_size})
@@ -852,6 +912,9 @@ def internal_send_mail(payload: InternalSendMailRequest, _=Depends(verify_intern
     sender_name = payload.sender_name.strip() or "Indoworkspace Security"
     now_iso = datetime.now(timezone.utc).isoformat()
     snippet = re.sub(r"\s+", " ", body)[:120]
+
+    # A runaway caller on your side must not be able to flood a mailbox.
+    take_slot("limits/internal", max_count=120, window_seconds=60)
 
     if to_email.endswith(f"@{DOMAIN_NAME}"):
         username = rtdb_safe_key(to_email.split("@")[0])
