@@ -110,6 +110,13 @@ class DeleteMessagesRequest(BaseModel):
     ids: List[str]
 
 
+class PublicSignupRequest(BaseModel):
+    username: str
+    name: str = ""
+    recovery_email: EmailStr
+    password: str
+
+
 class InternalRegisterMailboxRequest(BaseModel):
     uid: str
     username: str
@@ -166,6 +173,21 @@ def rtdb_safe_key(text: str) -> str:
     return text.strip().lower().replace(".", ",")
 
 
+def user_node(uid: str) -> str:
+    """Realtime Database keys cannot contain dots, so users/<email> is stored as
+    users/<email with , instead of .>. The uid itself stays the plain address."""
+    return rtdb_safe_key(uid)
+
+
+def resolve_uid(value) -> str:
+    """usernames/<name> now holds only the uid string; older entries held a dict."""
+    if isinstance(value, str):
+        return value.strip().lower()
+    if isinstance(value, dict):
+        return str(value.get("uid") or "").strip().lower()
+    return ""
+
+
 def send_via_brevo(sender_name: str, sender_email: str, to_email: str, subject: str, body: str,
                    cc: List[str] | None = None, bcc: List[str] | None = None):
     if not BREVO_API_KEY:
@@ -203,7 +225,13 @@ FORBIDDEN_RTDB_CHARS = set(".$#[]/\x00")
 
 
 def internal_safe_uid(raw_uid: str) -> str:
+    """A uid is now the mailbox address; older usr_ ids are still accepted."""
     uid = (raw_uid or "").strip()
+    if "@" in uid:
+        email = uid.lower()
+        if not re.match(r"^[a-z0-9][a-z0-9._-]{1,62}@" + re.escape(DOMAIN_NAME) + "$", email):
+            raise HTTPException(status_code=400, detail="Invalid mailbox address.")
+        return email
     if not SAFE_UID_RE.match(uid) or any(c in FORBIDDEN_RTDB_CHARS for c in uid):
         raise HTTPException(status_code=400, detail="Invalid uid.")
     return uid
@@ -274,32 +302,29 @@ def register_mailbox(payload: RegisterMailboxRequest, user=Depends(verify_fireba
     recovery_email = payload.recovery_email.strip().lower()
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    user_ref = rtdb.reference(f"users/{uid}")
+    node = user_node(uid)
+    user_ref = rtdb.reference(f"users/{node}")
     existing_user = user_ref.get()
     if existing_user:
         return {"status": "exists", "profile": existing_user}
 
     # The recovery address must be proven before the mailbox is created.
-    verified = rtdb.reference(f"signup_verified/{uid}").get()
+    verified = rtdb.reference(f"signup_verified/{user_node(uid)}").get()
     if not verified:
         raise HTTPException(status_code=403, detail="Verify your recovery email first.")
     if int(time.time()) > int(verified.get("expiresAt", 0)):
-        rtdb.reference(f"signup_verified/{uid}").delete()
+        rtdb.reference(f"signup_verified/{user_node(uid)}").delete()
         raise HTTPException(status_code=403, detail="Verification expired. Please verify again.")
     if (verified.get("recoveryEmail") or "").lower() != recovery_email:
         raise HTTPException(status_code=400, detail="Recovery email does not match the one you verified.")
 
     username_ref = rtdb.reference(f"usernames/{safe_user}")
-    if username_ref.get() is not None:
+    taken = username_ref.get()
+    if taken is not None and resolve_uid(taken) != uid:
         raise HTTPException(status_code=409, detail=f"{eyemail_address} is already taken.")
 
-    # Save username mapping in Realtime Database
-    username_ref.set({
-        "uid": uid,
-        "username": username,
-        "email": eyemail_address,
-        "createdAt": now_iso
-    })
+    # The index holds one line: the uid. Nothing else is duplicated here.
+    username_ref.set(uid)
 
     # Save user profile & quota in Realtime Database
     profile_data = {
@@ -336,7 +361,7 @@ def register_mailbox(payload: RegisterMailboxRequest, user=Depends(verify_fireba
         "createdAt": now_iso,
     })
 
-    rtdb.reference(f"signup_verified/{uid}").delete()
+    rtdb.reference(f"signup_verified/{user_node(uid)}").delete()
 
     return {"status": "created", "profile": profile_data}
 
@@ -344,10 +369,89 @@ def register_mailbox(payload: RegisterMailboxRequest, user=Depends(verify_fireba
 @app.get("/api/user/profile")
 def get_user_profile(user=Depends(verify_firebase_user)):
     uid = user["uid"]
-    profile = rtdb.reference(f"users/{uid}").get()
+    profile = rtdb.reference(f"users/{user_node(uid)}").get()
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found in Realtime Database")
     return {"profile": profile}
+
+
+# ==============================================================================
+# 1a. SIGNUP: THE ACCOUNT IS CREATED HERE, WITH THE ADDRESS AS THE UID
+# ==============================================================================
+@app.post("/api/auth/signup")
+def public_signup(payload: PublicSignupRequest):
+    """Create the Firebase account with uid = username@eyemail.in, then mail a code.
+
+    The uid has to be chosen by the server: a client signup gets a random uid, and
+    we want one identifier for the login, the profile and the mailbox.
+    """
+    username = validate_username_format(payload.username)
+    eyemail_address = f"{username}@{DOMAIN_NAME}"
+    clean_name = (payload.name or "").strip() or username
+    recovery_email = (payload.recovery_email or "").strip().lower()
+    password = payload.password or ""
+
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
+    if len(password) > 128:
+        raise HTTPException(status_code=400, detail="Password is too long.")
+
+    safe_user = rtdb_safe_key(username)
+    if rtdb.reference(f"usernames/{safe_user}").get() is not None:
+        raise HTTPException(status_code=409, detail=f"{eyemail_address} is already taken.")
+
+    try:
+        auth.get_user(eyemail_address)
+        raise HTTPException(status_code=409, detail=f"{eyemail_address} already has a login. Sign in instead.")
+    except auth.UserNotFoundError:
+        pass
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Could not check the address.")
+
+    try:
+        auth.create_user(
+            uid=eyemail_address,
+            email=eyemail_address,
+            password=password,
+            display_name=clean_name,
+            email_verified=True,
+        )
+    except auth.EmailAlreadyExistsError:
+        raise HTTPException(status_code=409, detail=f"{eyemail_address} already has a login. Sign in instead.")
+    except auth.UidAlreadyExistsError:
+        raise HTTPException(status_code=409, detail=f"{eyemail_address} already has a login. Sign in instead.")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Could not create the account.")
+
+    now = int(time.time())
+    otp_code = f"{secrets.randbelow(900000) + 100000}"
+    otp_ref = rtdb.reference(f"signup_otps/{user_node(eyemail_address)}")
+    otp_ref.set({
+        "otp": otp_code,
+        "recoveryEmail": recovery_email,
+        "expiresAt": now + SIGNUP_OTP_EXPIRY_SECONDS,
+        "attempts": 0,
+        "sentAt": now,
+    })
+
+    body = (
+        f"Welcome to Eyemail.\n\n"
+        f"Your verification code is:\n\n"
+        f"{otp_code}\n\n"
+        f"Enter it on the signup page to activate {eyemail_address}. It expires in 10 minutes.\n\n"
+        f"— Team Eyemail"
+    )
+    send_via_brevo("Eyemail", f"security@{DOMAIN_NAME}", recovery_email,
+                   f"{otp_code} is your Eyemail verification code", body)
+
+    return {
+        "status": "otp_sent",
+        "email": eyemail_address,
+        "maskedRecoveryEmail": mask_email(recovery_email),
+        "expiresInSeconds": SIGNUP_OTP_EXPIRY_SECONDS,
+    }
 
 
 # ==============================================================================
@@ -357,11 +461,11 @@ def get_user_profile(user=Depends(verify_firebase_user)):
 def send_signup_otp(payload: SignupOtpRequest, user=Depends(verify_firebase_user)):
     uid = user["uid"]
 
-    if rtdb.reference(f"users/{uid}").get():
+    if rtdb.reference(f"users/{user_node(uid)}").get():
         raise HTTPException(status_code=409, detail="This account is already registered. Please sign in.")
 
     recovery_email = payload.recovery_email.strip().lower()
-    otp_ref = rtdb.reference(f"signup_otps/{uid}")
+    otp_ref = rtdb.reference(f"signup_otps/{user_node(uid)}")
     previous = otp_ref.get() or {}
     now = int(time.time())
 
@@ -399,7 +503,7 @@ def send_signup_otp(payload: SignupOtpRequest, user=Depends(verify_firebase_user
 def verify_signup_otp(payload: VerifySignupOtpRequest, user=Depends(verify_firebase_user)):
     uid = user["uid"]
     entered = payload.otp.strip()
-    otp_ref = rtdb.reference(f"signup_otps/{uid}")
+    otp_ref = rtdb.reference(f"signup_otps/{user_node(uid)}")
     record = otp_ref.get()
 
     if not record:
@@ -418,7 +522,7 @@ def verify_signup_otp(payload: VerifySignupOtpRequest, user=Depends(verify_fireb
         raise HTTPException(status_code=400, detail="That code is not correct.")
 
     now = int(time.time())
-    rtdb.reference(f"signup_verified/{uid}").set({
+    rtdb.reference(f"signup_verified/{user_node(uid)}").set({
         "recoveryEmail": record.get("recoveryEmail", ""),
         "verifiedAt": now,
         "expiresAt": now + SIGNUP_VERIFIED_TTL_SECONDS,
@@ -434,7 +538,7 @@ def verify_signup_otp(payload: VerifySignupOtpRequest, user=Depends(verify_fireb
 @app.post("/api/auth/send-login-otp")
 def send_login_otp(user=Depends(verify_firebase_user)):
     uid = user["uid"]
-    profile = rtdb.reference(f"users/{uid}").get()
+    profile = rtdb.reference(f"users/{user_node(uid)}").get()
     if not profile:
         raise HTTPException(status_code=404, detail="User profile not found.")
 
@@ -495,7 +599,7 @@ def verify_login_otp(payload: VerifyLoginOtpRequest, user=Depends(verify_firebas
         raise HTTPException(status_code=400, detail="Invalid OTP code. Please try again.")
 
     otp_ref.delete()
-    rtdb.reference(f"users/{uid}/lastLoginAt").set(datetime.now(timezone.utc).isoformat())
+    rtdb.reference(f"users/{user_node(uid)}/lastLoginAt").set(datetime.now(timezone.utc).isoformat())
     return {"status": "verified"}
 
 
@@ -509,12 +613,11 @@ def forgot_password(payload: ForgotPasswordRequest):
     eyemail_address = f"{username}@{DOMAIN_NAME}"
     safe_user = rtdb_safe_key(username)
 
-    user_lookup = rtdb.reference(f"usernames/{safe_user}").get()
-    if not user_lookup:
+    uid = resolve_uid(rtdb.reference(f"usernames/{safe_user}").get())
+    if not uid:
         raise HTTPException(status_code=404, detail=f"No Eyemail account found for {eyemail_address}")
 
-    uid = user_lookup.get("uid")
-    profile = rtdb.reference(f"users/{uid}").get() or {}
+    profile = rtdb.reference(f"users/{user_node(uid)}").get() or {}
     recovery_email = (profile.get("recoveryEmail") or "").strip().lower()
 
     if not recovery_email or "@" not in recovery_email:
@@ -567,7 +670,7 @@ def add_business_domain(payload: AddBusinessDomainRequest, user=Depends(verify_f
         ]
     }
     dom_ref.set(domain_record)
-    rtdb.reference(f"users/{uid}/domains/{safe_dom}").set({"domain": domain, "verified": False})
+    rtdb.reference(f"users/{user_node(uid)}/domains/{safe_dom}").set({"domain": domain, "verified": False})
 
     return {"status": "added", "domainInfo": domain_record}
 
@@ -578,7 +681,7 @@ def add_business_domain(payload: AddBusinessDomainRequest, user=Depends(verify_f
 @app.post("/api/send-email")
 def send_email(payload: SendEmailRequest, user=Depends(verify_firebase_user)):
     uid = user["uid"]
-    user_ref = rtdb.reference(f"users/{uid}")
+    user_ref = rtdb.reference(f"users/{user_node(uid)}")
     user_data = user_ref.get()
 
     if not user_data:
@@ -642,12 +745,11 @@ def send_email(payload: SendEmailRequest, user=Depends(verify_firebase_user)):
     if all(addr.endswith(f"@{DOMAIN_NAME}") for addr in all_recipients):
         for addr in all_recipients:
             target_username = rtdb_safe_key(addr.split("@")[0])
-            username_data = rtdb.reference(f"usernames/{target_username}").get()
-            if not username_data:
+            target_uid = resolve_uid(rtdb.reference(f"usernames/{target_username}").get())
+            if not target_uid:
                 raise HTTPException(status_code=404, detail=f"Address {addr} does not exist.")
 
-            target_uid = username_data.get("uid")
-            target_user_ref = rtdb.reference(f"users/{target_uid}")
+            target_user_ref = rtdb.reference(f"users/{user_node(target_uid)}")
             target_used = int((target_user_ref.get() or {}).get("storageUsedBytes", 0))
 
             store_message(target_uid, "inbox", False, addr)
@@ -662,7 +764,7 @@ def send_email(payload: SendEmailRequest, user=Depends(verify_firebase_user)):
     # CASE B: at least one external recipient -> Brevo
     daily_limit = PAID_DAILY_EXTERNAL_LIMIT if user_plan != "free" else FREE_DAILY_EXTERNAL_LIMIT
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    usage_ref = rtdb.reference(f"usage/{uid}/{today_str}")
+    usage_ref = rtdb.reference(f"usage/{user_node(uid)}/{today_str}")
     sent_today = int((usage_ref.get() or {}).get("externalSent", 0))
 
     if sent_today >= daily_limit:
@@ -710,7 +812,7 @@ def delete_messages(payload: DeleteMessagesRequest, user=Depends(verify_firebase
         deleted += 1
 
     if freed:
-        user_ref = rtdb.reference(f"users/{uid}")
+        user_ref = rtdb.reference(f"users/{user_node(uid)}")
         used = int((user_ref.get() or {}).get("storageUsedBytes", 0))
         user_ref.update({"storageUsedBytes": max(0, used - freed)})
 
@@ -776,13 +878,12 @@ async def inbound_email_webhook(request: Request, x_webhook_secret: str = Header
         raise HTTPException(status_code=400, detail="Invalid recipient domain")
 
     target_username = rtdb_safe_key(to_email.split("@")[0])
-    username_data = rtdb.reference(f"usernames/{target_username}").get()
+    target_uid = resolve_uid(rtdb.reference(f"usernames/{target_username}").get())
 
-    if not username_data:
+    if not target_uid:
         raise HTTPException(status_code=404, detail=f"Mailbox {to_email} does not exist")
 
-    target_uid = username_data.get("uid")
-    target_user_ref = rtdb.reference(f"users/{target_uid}")
+    target_user_ref = rtdb.reference(f"users/{user_node(target_uid)}")
     target_used = int((target_user_ref.get() or {}).get("storageUsedBytes", 0))
 
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -823,7 +924,7 @@ def internal_register_mailbox(payload: InternalRegisterMailboxRequest,
     recovery_email = (payload.recovery_email or "").strip().lower()
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    user_ref = rtdb.reference(f"users/{uid}")
+    user_ref = rtdb.reference(f"users/{user_node(uid)}")
     existing_user = user_ref.get()
     if existing_user:
         # Idempotent: never overwrite a profile, never add a second welcome mail.
@@ -856,12 +957,8 @@ def internal_register_mailbox(payload: InternalRegisterMailboxRequest,
                 detail=f"{eyemail_address} is already a login for another account ({owner_uid}).",
             )
 
-    username_ref.set({
-        "uid": uid,
-        "username": username,
-        "email": eyemail_address,
-        "createdAt": now_iso,
-    })
+    # One line only: the uid. The profile lives in one node, not here.
+    username_ref.set(uid)
 
     used_bytes = existing_mail_bytes(uid) or 512
     profile_data = {
@@ -886,7 +983,7 @@ def internal_register_mailbox(payload: InternalRegisterMailboxRequest,
 def internal_delete_mailbox(raw_uid: str, _=Depends(verify_internal_secret)):
     """Remove the mailbox for a uid. 404 means there was nothing to delete."""
     uid = internal_safe_uid(raw_uid)
-    user_ref = rtdb.reference(f"users/{uid}")
+    user_ref = rtdb.reference(f"users/{user_node(uid)}")
     profile = user_ref.get()
     if not profile:
         raise HTTPException(status_code=404, detail="No mailbox for this uid.")
@@ -914,7 +1011,7 @@ def internal_delete_mailbox(raw_uid: str, _=Depends(verify_internal_secret)):
     if safe_user:
         rtdb.reference(f"usernames/{safe_user}").delete()
     user_ref.delete()
-    rtdb.reference(f"signup_verified/{uid}").delete()
+    rtdb.reference(f"signup_verified/{user_node(uid)}").delete()
 
     print(f"[internal] deleted mailbox uid={uid} username={username} messages={deleted_messages}",
           flush=True)
@@ -930,7 +1027,7 @@ def internal_mail_session(payload: MailSessionRequest, _=Depends(verify_internal
     mailbox, so this key must stay server-side.
     """
     uid = internal_safe_uid(payload.uid)
-    profile = rtdb.reference(f"users/{uid}").get()
+    profile = rtdb.reference(f"users/{user_node(uid)}").get()
     if not profile:
         raise HTTPException(status_code=404, detail="No mailbox for this uid.")
 
@@ -965,7 +1062,7 @@ def internal_rename_mailbox(raw_uid: str, payload: InternalRenameRequest,
                             _=Depends(verify_internal_secret)):
     """Change only the display name. The address and the mail never move."""
     uid = internal_safe_uid(raw_uid)
-    user_ref = rtdb.reference(f"users/{uid}")
+    user_ref = rtdb.reference(f"users/{user_node(uid)}")
     profile = user_ref.get()
     if not profile:
         raise HTTPException(status_code=404, detail="No mailbox for this uid.")
@@ -976,7 +1073,7 @@ def internal_rename_mailbox(raw_uid: str, payload: InternalRenameRequest,
     if len(new_name) > 80:
         raise HTTPException(status_code=400, detail="Name is too long (max 80 characters).")
 
-    rtdb.reference(f"users/{uid}/name").set(new_name)
+    rtdb.reference(f"users/{user_node(uid)}/name").set(new_name)
     profile["name"] = new_name
 
     # Best effort: the mailbox is the source of truth, Auth is a copy of the name.
@@ -1003,11 +1100,9 @@ def internal_send_mail(payload: InternalSendMailRequest, _=Depends(verify_intern
 
     if to_email.endswith(f"@{DOMAIN_NAME}"):
         username = rtdb_safe_key(to_email.split("@")[0])
-        user_lookup = rtdb.reference(f"usernames/{username}").get()
-        if not user_lookup:
+        target_uid = resolve_uid(rtdb.reference(f"usernames/{username}").get())
+        if not target_uid:
             raise HTTPException(status_code=404, detail="Eyemail recipient does not exist")
-
-        target_uid = user_lookup.get("uid")
         fs_db.collection("users").document(target_uid).collection("emails").add({
             "from": f"noreply@{DOMAIN_NAME}",
             "fromName": sender_name,
