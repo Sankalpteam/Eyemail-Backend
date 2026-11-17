@@ -828,6 +828,27 @@ def internal_register_mailbox(payload: InternalRegisterMailboxRequest,
     if taken is not None and (taken or {}).get("uid") != uid:
         raise HTTPException(status_code=409, detail=f"{eyemail_address} is already taken.")
 
+    # The webmail reads users/{auth.uid}/emails, so the Auth record must carry the
+    # same uid we use as the mailbox key. Created before any data is written.
+    try:
+        auth.create_user(uid=uid, email=eyemail_address, display_name=clean_name,
+                         email_verified=True)
+    except auth.UidAlreadyExistsError:
+        pass
+    except auth.EmailAlreadyExistsError:
+        # The address already belongs to a different Firebase account. Silently
+        # continuing would create a mailbox the UI can never open.
+        try:
+            owner = auth.get_user_by_email(eyemail_address)
+            owner_uid = owner.uid
+        except Exception:
+            owner_uid = "unknown"
+        if owner_uid != uid:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{eyemail_address} is already a login for another account ({owner_uid}).",
+            )
+
     username_ref.set({
         "uid": uid,
         "username": username,
@@ -876,6 +897,13 @@ def internal_delete_mailbox(raw_uid: str, _=Depends(verify_internal_secret)):
         print(f"[internal] mail delete failed uid={uid} {error}", flush=True)
         raise HTTPException(status_code=500, detail="Mail could not be deleted.")
 
+    # Remove the login before the profile, so a deleted account can never sign in
+    # to a half-removed mailbox.
+    try:
+        auth.delete_user(uid)
+    except auth.UserNotFoundError:
+        pass
+
     if safe_user:
         rtdb.reference(f"usernames/{safe_user}").delete()
     user_ref.delete()
@@ -905,6 +933,12 @@ def internal_rename_mailbox(raw_uid: str, payload: InternalRenameRequest,
 
     rtdb.reference(f"users/{uid}/name").set(new_name)
     profile["name"] = new_name
+
+    # Best effort: the mailbox is the source of truth, Auth is a copy of the name.
+    try:
+        auth.update_user(uid, display_name=new_name)
+    except Exception:
+        pass
 
     return {"status": "renamed", "profile": profile}
 
