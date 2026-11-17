@@ -7,7 +7,7 @@ from email import policy
 from email.parser import Parser
 from email.utils import parseaddr
 from datetime import datetime, timezone
-from fastapi import FastAPI, HTTPException, Header, Depends, Request
+from fastapi import FastAPI, HTTPException, Header, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List
 from pydantic import BaseModel, EmailStr, Field
@@ -107,6 +107,17 @@ class DeleteMessagesRequest(BaseModel):
     ids: List[str]
 
 
+class InternalRegisterMailboxRequest(BaseModel):
+    uid: str
+    username: str
+    name: str = ""
+    recovery_email: str = ""
+
+
+class InternalRenameRequest(BaseModel):
+    name: str
+
+
 class InternalSendMailRequest(BaseModel):
     to: EmailStr
     subject: str
@@ -178,6 +189,51 @@ def mask_email(addr: str) -> str:
     local, dom = addr.split("@", 1)
     prefix = local[:2] if len(local) >= 2 else local[:1]
     return f"{prefix}***@{dom}"
+
+
+SAFE_UID_RE = re.compile(r"^[A-Za-z0-9_-]{3,64}$")
+FORBIDDEN_RTDB_CHARS = set(".$#[]/\x00")
+
+
+def internal_safe_uid(raw_uid: str) -> str:
+    uid = (raw_uid or "").strip()
+    if not SAFE_UID_RE.match(uid) or any(c in FORBIDDEN_RTDB_CHARS for c in uid):
+        raise HTTPException(status_code=400, detail="Invalid uid.")
+    return uid
+
+
+def add_welcome_email(uid: str, clean_name: str, eyemail_address: str, now_iso: str):
+    fs_db.collection("users").document(uid).collection("emails").add({
+        "from": f"welcome@{DOMAIN_NAME}",
+        "fromName": "Eyemail Team",
+        "to": eyemail_address,
+        "subject": f"Welcome to Eyemail, {clean_name}!",
+        "body": (
+            f"Hi {clean_name},\n\n"
+            f"Your {eyemail_address} mailbox is active with 1 GB free storage.\n\n"
+            f"You can send and receive emails with Gmail, Yahoo, and other Eyemail users instantly.\n\n"
+            f"— Team Eyemail"
+        ),
+        "snippet": f"Hi {clean_name}, your {eyemail_address} mailbox is now active.",
+        "folder": "inbox",
+        "read": False,
+        "starred": True,
+        "timestamp": firestore.SERVER_TIMESTAMP,
+        "createdAt": now_iso,
+    })
+
+
+def existing_mail_bytes(uid: str) -> int:
+    """Bytes already stored for this mailbox, used when a profile is rebuilt."""
+    total = 0
+    try:
+        for doc in fs_db.collection("users").document(uid).collection("emails").stream():
+            data = doc.to_dict() or {}
+            total += len((data.get("body") or "").encode("utf-8"))
+            total += len((data.get("subject") or "").encode("utf-8")) + 256
+    except Exception:
+        return 0
+    return total
 
 
 @app.get("/health")
@@ -742,6 +798,115 @@ async def inbound_email_webhook(request: Request, x_webhook_secret: str = Header
     target_user_ref.update({"storageUsedBytes": target_used + msg_size})
 
     return {"status": "received", "to": to_email}
+
+
+# ==============================================================================
+# 7. INTERNAL ACCOUNT BRIDGE (Indo Account owns identity, Eyemail owns letters)
+# ==============================================================================
+@app.post("/api/internal/register-mailbox", status_code=201)
+def internal_register_mailbox(payload: InternalRegisterMailboxRequest,
+                              response: Response,
+                              _=Depends(verify_internal_secret)):
+    """Create a mailbox for a uid owned by Indo Account. Safe to call twice."""
+    uid = internal_safe_uid(payload.uid)
+    username = validate_username_format(payload.username)
+    safe_user = rtdb_safe_key(username)
+    eyemail_address = f"{username}@{DOMAIN_NAME}"
+    clean_name = (payload.name or "").strip() or username
+    recovery_email = (payload.recovery_email or "").strip().lower()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    user_ref = rtdb.reference(f"users/{uid}")
+    existing_user = user_ref.get()
+    if existing_user:
+        # Idempotent: never overwrite a profile, never add a second welcome mail.
+        response.status_code = 200
+        return {"status": "exists", "profile": existing_user}
+
+    username_ref = rtdb.reference(f"usernames/{safe_user}")
+    taken = username_ref.get()
+    if taken is not None and (taken or {}).get("uid") != uid:
+        raise HTTPException(status_code=409, detail=f"{eyemail_address} is already taken.")
+
+    username_ref.set({
+        "uid": uid,
+        "username": username,
+        "email": eyemail_address,
+        "createdAt": now_iso,
+    })
+
+    used_bytes = existing_mail_bytes(uid) or 512
+    profile_data = {
+        "uid": uid,
+        "name": clean_name,
+        "username": username,
+        "email": eyemail_address,
+        "recoveryEmail": recovery_email,
+        "recoveryVerified": True,
+        "plan": "free",
+        "storageUsedBytes": used_bytes,
+        "storageLimitBytes": FREE_STORAGE_LIMIT_BYTES,
+        "createdAt": now_iso,
+    }
+    user_ref.set(profile_data)
+    add_welcome_email(uid, clean_name, eyemail_address, now_iso)
+
+    return {"status": "created", "profile": profile_data}
+
+
+@app.delete("/api/internal/register-mailbox/{raw_uid}")
+def internal_delete_mailbox(raw_uid: str, _=Depends(verify_internal_secret)):
+    """Remove the mailbox for a uid. 404 means there was nothing to delete."""
+    uid = internal_safe_uid(raw_uid)
+    user_ref = rtdb.reference(f"users/{uid}")
+    profile = user_ref.get()
+    if not profile:
+        raise HTTPException(status_code=404, detail="No mailbox for this uid.")
+
+    username = profile.get("username", "")
+    safe_user = rtdb_safe_key(username) if username else None
+
+    deleted_messages = 0
+    try:
+        collection = fs_db.collection("users").document(uid).collection("emails")
+        for doc in collection.stream():
+            doc.reference.delete()
+            deleted_messages += 1
+    except Exception as error:
+        print(f"[internal] mail delete failed uid={uid} {error}", flush=True)
+        raise HTTPException(status_code=500, detail="Mail could not be deleted.")
+
+    if safe_user:
+        rtdb.reference(f"usernames/{safe_user}").delete()
+    user_ref.delete()
+    rtdb.reference(f"signup_verified/{uid}").delete()
+
+    print(f"[internal] deleted mailbox uid={uid} username={username} messages={deleted_messages}",
+          flush=True)
+
+    return {"status": "deleted", "username": username, "messages": deleted_messages}
+
+
+@app.patch("/api/internal/register-mailbox/{raw_uid}")
+def internal_rename_mailbox(raw_uid: str, payload: InternalRenameRequest,
+                            _=Depends(verify_internal_secret)):
+    """Change only the display name. The address and the mail never move."""
+    uid = internal_safe_uid(raw_uid)
+    user_ref = rtdb.reference(f"users/{uid}")
+    profile = user_ref.get()
+    if not profile:
+        raise HTTPException(status_code=404, detail="No mailbox for this uid.")
+
+    new_name = (payload.name or "").strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="Name cannot be empty.")
+    if len(new_name) > 80:
+        raise HTTPException(status_code=400, detail="Name is too long (max 80 characters).")
+
+    rtdb.reference(f"users/{uid}/name").set(new_name)
+    profile["name"] = new_name
+
+    return {"status": "renamed", "profile": profile}
 
 
 # ==============================================================================
