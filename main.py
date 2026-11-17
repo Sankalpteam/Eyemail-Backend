@@ -257,6 +257,52 @@ def count_daily(path: str, daily_limit: int) -> int:
     return 0
 
 
+SPAM_WORDS = (
+    "viagra", "casino", "lottery", "you have won", "claim your prize", "crypto giveaway",
+    "work from home", "100% free", "risk free", "act now", "limited time offer",
+    "click here to claim", "wire transfer", "inheritance", "bitcoin investment",
+    "no credit check", "guaranteed loan", "make money fast", "unclaimed funds",
+)
+SPAM_THRESHOLD = 3
+
+
+def spam_score(subject: str, body: str) -> tuple:
+    """A deliberately simple first filter: (score, reasons).
+
+    It reads the subject and body only, because the worker hands us plain text.
+    It is a net for obvious junk, not a spam engine.
+    """
+    subject = subject or ""
+    text = f"{subject}\n{body or ''}".lower()
+    score = 0
+    reasons = []
+
+    for word in SPAM_WORDS:
+        if word in text:
+            score += 1
+            reasons.append(f"phrase:{word}")
+
+    links = len(re.findall(r"https?://", text))
+    if links >= 5:
+        score += 2
+        reasons.append(f"links:{links}")
+
+    if re.search(r"\b(free|winner|urgent|guaranteed)\b", subject.lower()):
+        score += 1
+        reasons.append("subject-claim")
+
+    letters = [c for c in subject if c.isalpha()]
+    if len(letters) >= 8 and sum(1 for c in letters if c.isupper()) / len(letters) > 0.7:
+        score += 1
+        reasons.append("shouting")
+
+    if subject.count("!") >= 2:
+        score += 1
+        reasons.append("exclaim")
+
+    return score, reasons
+
+
 def storage_state(profile: dict) -> tuple:
     """(used, limit, is_full) for a profile node."""
     used = int((profile or {}).get("storageUsedBytes", 0) or 0)
@@ -934,6 +980,9 @@ async def inbound_email_webhook(request: Request, x_webhook_secret: str = Header
     snippet = re.sub(r"\s+", " ", body)[:120]
     msg_size = len(body.encode("utf-8")) + len(subject.encode("utf-8")) + 256
 
+    score, reasons = spam_score(subject, body)
+    target_folder = "spam" if score >= SPAM_THRESHOLD else "inbox"
+
     fs_db.collection("users").document(target_uid).collection("emails").add({
         "from": sender_email,
         "fromName": sender_name or sender_email,
@@ -941,11 +990,12 @@ async def inbound_email_webhook(request: Request, x_webhook_secret: str = Header
         "subject": subject,
         "body": body,
         "snippet": snippet,
-        "folder": "inbox",
+        "folder": target_folder,
         "read": False,
         "starred": False,
         "timestamp": firestore.SERVER_TIMESTAMP,
         "createdAt": now_iso,
+        **({"spamScore": score, "spamReasons": reasons} if target_folder == "spam" else {}),
     })
     target_user_ref.update({"storageUsedBytes": target_used + msg_size})
 
