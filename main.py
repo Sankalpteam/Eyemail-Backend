@@ -812,6 +812,39 @@ def delete_messages(payload: DeleteMessagesRequest, user=Depends(verify_firebase
 
 
 # ==============================================================================
+# 5c. EMPTY TRASH IN ONE CALL
+# ==============================================================================
+@app.post("/api/messages/empty-trash")
+def empty_trash(user=Depends(verify_firebase_user)):
+    """Delete everything in Trash and give the space back."""
+    uid = user["uid"]
+    coll = fs_db.collection("users").document(uid).collection("emails")
+
+    try:
+        docs = list(coll.where("folder", "==", "trash").stream())
+    except Exception:
+        raise HTTPException(status_code=500, detail="Could not read Trash.")
+
+    freed = 0
+    deleted = 0
+    for doc in docs:
+        data = doc.to_dict() or {}
+        freed += len((data.get("body") or "").encode()) + len((data.get("subject") or "").encode()) + 256
+        try:
+            doc.reference.delete()
+            deleted += 1
+        except Exception as error:
+            print(f"[trash] could not delete {doc.id}: {error}", flush=True)
+
+    if freed:
+        user_ref = rtdb.reference(f"users/{user_node(uid)}")
+        current = int((user_ref.get() or {}).get("storageUsedBytes", 0))
+        user_ref.update({"storageUsedBytes": max(0, current - freed)})
+
+    return {"status": "emptied", "deleted": deleted, "freedBytes": freed}
+
+
+# ==============================================================================
 # 6. CLOUDFLARE INBOUND EMAIL WEBHOOK (External Gmail/Yahoo -> Firestore Inbox)
 # ==============================================================================
 @app.post("/webhook/inbound")
