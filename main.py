@@ -7,7 +7,6 @@ from email import policy
 from email.parser import Parser
 from email.utils import parseaddr
 from datetime import datetime, timezone
-from urllib.parse import quote
 from fastapi import FastAPI, HTTPException, Header, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List
@@ -55,8 +54,6 @@ app.add_middleware(
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
 INTERNAL_API_SECRET = os.environ.get("INTERNAL_API_SECRET", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-# Where a mail session link should land. Override in Render if the site moves.
-MAIL_SESSION_BASE_URL = os.environ.get("MAIL_SESSION_BASE_URL", "https://eyemail.in").rstrip("/")
 DOMAIN_NAME = "eyemail.in"
 FREE_STORAGE_LIMIT_BYTES = 1 * 1024 * 1024 * 1024  # 1 GB Free Storage
 FREE_DAILY_EXTERNAL_LIMIT = int(os.environ.get("DAILY_EXTERNAL_LIMIT", "50"))
@@ -115,21 +112,6 @@ class PublicSignupRequest(BaseModel):
     name: str = ""
     recovery_email: EmailStr
     password: str
-
-
-class InternalRegisterMailboxRequest(BaseModel):
-    uid: str
-    username: str
-    name: str = ""
-    recovery_email: str = ""
-
-
-class InternalRenameRequest(BaseModel):
-    name: str
-
-
-class MailSessionRequest(BaseModel):
-    uid: str
 
 
 class InternalSendMailRequest(BaseModel):
@@ -218,57 +200,6 @@ def mask_email(addr: str) -> str:
     local, dom = addr.split("@", 1)
     prefix = local[:2] if len(local) >= 2 else local[:1]
     return f"{prefix}***@{dom}"
-
-
-SAFE_UID_RE = re.compile(r"^[A-Za-z0-9_-]{3,64}$")
-FORBIDDEN_RTDB_CHARS = set(".$#[]/\x00")
-
-
-def internal_safe_uid(raw_uid: str) -> str:
-    """A uid is now the mailbox address; older usr_ ids are still accepted."""
-    uid = (raw_uid or "").strip()
-    if "@" in uid:
-        email = uid.lower()
-        if not re.match(r"^[a-z0-9][a-z0-9._-]{1,62}@" + re.escape(DOMAIN_NAME) + "$", email):
-            raise HTTPException(status_code=400, detail="Invalid mailbox address.")
-        return email
-    if not SAFE_UID_RE.match(uid) or any(c in FORBIDDEN_RTDB_CHARS for c in uid):
-        raise HTTPException(status_code=400, detail="Invalid uid.")
-    return uid
-
-
-def add_welcome_email(uid: str, clean_name: str, eyemail_address: str, now_iso: str):
-    fs_db.collection("users").document(uid).collection("emails").add({
-        "from": f"welcome@{DOMAIN_NAME}",
-        "fromName": "Eyemail Team",
-        "to": eyemail_address,
-        "subject": f"Welcome to Eyemail, {clean_name}!",
-        "body": (
-            f"Hi {clean_name},\n\n"
-            f"Your {eyemail_address} mailbox is active with 1 GB free storage.\n\n"
-            f"You can send and receive emails with Gmail, Yahoo, and other Eyemail users instantly.\n\n"
-            f"— Team Eyemail"
-        ),
-        "snippet": f"Hi {clean_name}, your {eyemail_address} mailbox is now active.",
-        "folder": "inbox",
-        "read": False,
-        "starred": True,
-        "timestamp": firestore.SERVER_TIMESTAMP,
-        "createdAt": now_iso,
-    })
-
-
-def existing_mail_bytes(uid: str) -> int:
-    """Bytes already stored for this mailbox, used when a profile is rebuilt."""
-    total = 0
-    try:
-        for doc in fs_db.collection("users").document(uid).collection("emails").stream():
-            data = doc.to_dict() or {}
-            total += len((data.get("body") or "").encode("utf-8"))
-            total += len((data.get("subject") or "").encode("utf-8")) + 256
-    except Exception:
-        return 0
-    return total
 
 
 @app.get("/health")
@@ -906,183 +837,6 @@ async def inbound_email_webhook(request: Request, x_webhook_secret: str = Header
     target_user_ref.update({"storageUsedBytes": target_used + msg_size})
 
     return {"status": "received", "to": to_email}
-
-
-# ==============================================================================
-# 7. INTERNAL ACCOUNT BRIDGE (Indo Account owns identity, Eyemail owns letters)
-# ==============================================================================
-@app.post("/api/internal/register-mailbox", status_code=201)
-def internal_register_mailbox(payload: InternalRegisterMailboxRequest,
-                              response: Response,
-                              _=Depends(verify_internal_secret)):
-    """Create a mailbox for a uid owned by Indo Account. Safe to call twice."""
-    uid = internal_safe_uid(payload.uid)
-    username = validate_username_format(payload.username)
-    safe_user = rtdb_safe_key(username)
-    eyemail_address = f"{username}@{DOMAIN_NAME}"
-    clean_name = (payload.name or "").strip() or username
-    recovery_email = (payload.recovery_email or "").strip().lower()
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    user_ref = rtdb.reference(f"users/{user_node(uid)}")
-    existing_user = user_ref.get()
-    if existing_user:
-        # Idempotent: never overwrite a profile, never add a second welcome mail.
-        response.status_code = 200
-        return {"status": "exists", "profile": existing_user}
-
-    username_ref = rtdb.reference(f"usernames/{safe_user}")
-    taken = username_ref.get()
-    if taken is not None and (taken or {}).get("uid") != uid:
-        raise HTTPException(status_code=409, detail=f"{eyemail_address} is already taken.")
-
-    # The webmail reads users/{auth.uid}/emails, so the Auth record must carry the
-    # same uid we use as the mailbox key. Created before any data is written.
-    try:
-        auth.create_user(uid=uid, email=eyemail_address, display_name=clean_name,
-                         email_verified=True)
-    except auth.UidAlreadyExistsError:
-        pass
-    except auth.EmailAlreadyExistsError:
-        # The address already belongs to a different Firebase account. Silently
-        # continuing would create a mailbox the UI can never open.
-        try:
-            owner = auth.get_user_by_email(eyemail_address)
-            owner_uid = owner.uid
-        except Exception:
-            owner_uid = "unknown"
-        if owner_uid != uid:
-            raise HTTPException(
-                status_code=409,
-                detail=f"{eyemail_address} is already a login for another account ({owner_uid}).",
-            )
-
-    # One line only: the uid. The profile lives in one node, not here.
-    username_ref.set(uid)
-
-    used_bytes = existing_mail_bytes(uid) or 512
-    profile_data = {
-        "uid": uid,
-        "name": clean_name,
-        "username": username,
-        "email": eyemail_address,
-        "recoveryEmail": recovery_email,
-        "recoveryVerified": True,
-        "plan": "free",
-        "storageUsedBytes": used_bytes,
-        "storageLimitBytes": FREE_STORAGE_LIMIT_BYTES,
-        "createdAt": now_iso,
-    }
-    user_ref.set(profile_data)
-    add_welcome_email(uid, clean_name, eyemail_address, now_iso)
-
-    return {"status": "created", "profile": profile_data}
-
-
-@app.delete("/api/internal/register-mailbox/{raw_uid}")
-def internal_delete_mailbox(raw_uid: str, _=Depends(verify_internal_secret)):
-    """Remove the mailbox for a uid. 404 means there was nothing to delete."""
-    uid = internal_safe_uid(raw_uid)
-    user_ref = rtdb.reference(f"users/{user_node(uid)}")
-    profile = user_ref.get()
-    if not profile:
-        raise HTTPException(status_code=404, detail="No mailbox for this uid.")
-
-    username = profile.get("username", "")
-    safe_user = rtdb_safe_key(username) if username else None
-
-    deleted_messages = 0
-    try:
-        collection = fs_db.collection("users").document(uid).collection("emails")
-        for doc in collection.stream():
-            doc.reference.delete()
-            deleted_messages += 1
-    except Exception as error:
-        print(f"[internal] mail delete failed uid={uid} {error}", flush=True)
-        raise HTTPException(status_code=500, detail="Mail could not be deleted.")
-
-    # Remove the login before the profile, so a deleted account can never sign in
-    # to a half-removed mailbox.
-    try:
-        auth.delete_user(uid)
-    except auth.UserNotFoundError:
-        pass
-
-    if safe_user:
-        rtdb.reference(f"usernames/{safe_user}").delete()
-    user_ref.delete()
-    rtdb.reference(f"signup_verified/{user_node(uid)}").delete()
-
-    print(f"[internal] deleted mailbox uid={uid} username={username} messages={deleted_messages}",
-          flush=True)
-
-    return {"status": "deleted", "username": username, "messages": deleted_messages}
-
-
-@app.post("/api/internal/mail-session")
-def internal_mail_session(payload: MailSessionRequest, _=Depends(verify_internal_secret)):
-    """Mint a one-time sign-in token so the panel can open this mailbox.
-
-    The token is never logged. Anyone holding INTERNAL_API_SECRET can open any
-    mailbox, so this key must stay server-side.
-    """
-    uid = internal_safe_uid(payload.uid)
-    profile = rtdb.reference(f"users/{user_node(uid)}").get()
-    if not profile:
-        raise HTTPException(status_code=404, detail="No mailbox for this uid.")
-
-    try:
-        auth.get_user(uid)
-    except auth.UserNotFoundError:
-        raise HTTPException(
-            status_code=409,
-            detail="This mailbox has no login record yet. Run backfill_auth_users.py.",
-        )
-    except Exception:
-        raise HTTPException(status_code=500, detail="Could not read the login record.")
-
-    try:
-        token = auth.create_custom_token(uid)
-    except Exception:
-        raise HTTPException(status_code=500, detail="Could not create a session token.")
-
-    if isinstance(token, bytes):
-        token = token.decode("utf-8")
-
-    email = (profile.get("email") or "").lower()
-    return {
-        "customToken": token,
-        "email": email,
-        "url": f"{MAIL_SESSION_BASE_URL}/login.html#t={quote(token, safe='')}",
-    }
-
-
-@app.patch("/api/internal/register-mailbox/{raw_uid}")
-def internal_rename_mailbox(raw_uid: str, payload: InternalRenameRequest,
-                            _=Depends(verify_internal_secret)):
-    """Change only the display name. The address and the mail never move."""
-    uid = internal_safe_uid(raw_uid)
-    user_ref = rtdb.reference(f"users/{user_node(uid)}")
-    profile = user_ref.get()
-    if not profile:
-        raise HTTPException(status_code=404, detail="No mailbox for this uid.")
-
-    new_name = (payload.name or "").strip()
-    if not new_name:
-        raise HTTPException(status_code=400, detail="Name cannot be empty.")
-    if len(new_name) > 80:
-        raise HTTPException(status_code=400, detail="Name is too long (max 80 characters).")
-
-    rtdb.reference(f"users/{user_node(uid)}/name").set(new_name)
-    profile["name"] = new_name
-
-    # Best effort: the mailbox is the source of truth, Auth is a copy of the name.
-    try:
-        auth.update_user(uid, display_name=new_name)
-    except Exception:
-        pass
-
-    return {"status": "renamed", "profile": profile}
 
 
 # ==============================================================================
