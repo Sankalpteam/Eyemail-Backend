@@ -258,10 +258,11 @@ def register_mailbox(payload: RegisterMailboxRequest, user=Depends(verify_fireba
     username_ref.set(uid)
 
     # Save user profile & quota in Realtime Database
+    # Only what the mail product needs. The address is the uid, so it is stored
+    # once as email; the local part is derived, never copied. Nothing about a
+    # person's identity beyond this belongs here.
     profile_data = {
-        "uid": uid,
         "name": clean_name,
-        "username": username,
         "email": eyemail_address,
         "recoveryEmail": recovery_email,
         "recoveryVerified": True,
