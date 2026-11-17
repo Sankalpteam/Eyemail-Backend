@@ -7,6 +7,7 @@ from email import policy
 from email.parser import Parser
 from email.utils import parseaddr
 from datetime import datetime, timezone
+from urllib.parse import quote
 from fastapi import FastAPI, HTTPException, Header, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List
@@ -54,6 +55,8 @@ app.add_middleware(
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
 INTERNAL_API_SECRET = os.environ.get("INTERNAL_API_SECRET", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+# Where a mail session link should land. Override in Render if the site moves.
+MAIL_SESSION_BASE_URL = os.environ.get("MAIL_SESSION_BASE_URL", "https://eyemail.in").rstrip("/")
 DOMAIN_NAME = "eyemail.in"
 FREE_STORAGE_LIMIT_BYTES = 1 * 1024 * 1024 * 1024  # 1 GB Free Storage
 FREE_DAILY_EXTERNAL_LIMIT = int(os.environ.get("DAILY_EXTERNAL_LIMIT", "50"))
@@ -116,6 +119,10 @@ class InternalRegisterMailboxRequest(BaseModel):
 
 class InternalRenameRequest(BaseModel):
     name: str
+
+
+class MailSessionRequest(BaseModel):
+    uid: str
 
 
 class InternalSendMailRequest(BaseModel):
@@ -913,6 +920,44 @@ def internal_delete_mailbox(raw_uid: str, _=Depends(verify_internal_secret)):
           flush=True)
 
     return {"status": "deleted", "username": username, "messages": deleted_messages}
+
+
+@app.post("/api/internal/mail-session")
+def internal_mail_session(payload: MailSessionRequest, _=Depends(verify_internal_secret)):
+    """Mint a one-time sign-in token so the panel can open this mailbox.
+
+    The token is never logged. Anyone holding INTERNAL_API_SECRET can open any
+    mailbox, so this key must stay server-side.
+    """
+    uid = internal_safe_uid(payload.uid)
+    profile = rtdb.reference(f"users/{uid}").get()
+    if not profile:
+        raise HTTPException(status_code=404, detail="No mailbox for this uid.")
+
+    try:
+        auth.get_user(uid)
+    except auth.UserNotFoundError:
+        raise HTTPException(
+            status_code=409,
+            detail="This mailbox has no login record yet. Run backfill_auth_users.py.",
+        )
+    except Exception:
+        raise HTTPException(status_code=500, detail="Could not read the login record.")
+
+    try:
+        token = auth.create_custom_token(uid)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Could not create a session token.")
+
+    if isinstance(token, bytes):
+        token = token.decode("utf-8")
+
+    email = (profile.get("email") or "").lower()
+    return {
+        "customToken": token,
+        "email": email,
+        "url": f"{MAIL_SESSION_BASE_URL}/login.html#t={quote(token, safe='')}",
+    }
 
 
 @app.patch("/api/internal/register-mailbox/{raw_uid}")
