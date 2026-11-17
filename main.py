@@ -235,7 +235,8 @@ def take_slot(path: str, max_count: int, window_seconds: int) -> None:
     except RateLimited as limited:
         raise HTTPException(
             status_code=429,
-            detail=f"Too many requests. Try again in {limited.retry_after_seconds}s.",
+            detail=(f"Free plan: a short pause between sends. Try again in "
+                    f"{limited.retry_after_seconds}s. This keeps one account from flooding another."),
         )
     except Exception:
         # A counter that cannot be written must not take the service down.
@@ -258,7 +259,8 @@ def count_daily(path: str, daily_limit: int) -> int:
     except RateLimited:
         raise HTTPException(
             status_code=429,
-            detail=f"Daily external limit ({daily_limit} emails/day) reached.",
+            detail=(f"Free plan: {daily_limit} outside mails a day. The limit exists to keep the "
+                    f"service clear of spam and abuse, not because mail is short."),
         )
     except Exception:
         print(f"[limit] could not record {path}", flush=True)
@@ -940,7 +942,8 @@ def send_email(payload: SendEmailRequest, user=Depends(verify_firebase_user)):
     if sender_full:
         raise HTTPException(
             status_code=507,
-            detail="Your mailbox is full. Empty Trash or delete some mail to send again.",
+            detail=("Free plan storage is full. Empty Trash or delete some mail, "
+                    "and sending works again."),
         )
 
     # CASE A: every recipient is @eyemail.in -> deliver inside, no Brevo call
