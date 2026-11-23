@@ -766,6 +766,14 @@ def sign_out_all(user=Depends(verify_firebase_user)):
         auth.revoke_refresh_tokens(uid)
     except Exception:
         raise HTTPException(status_code=500, detail="Could not end the other sessions.")
+
+    # The phones must stop buzzing too, or "signed out everywhere" is only half true.
+    for path in (f"fcm/{_push_key(uid)}", f"push/{_push_key(uid)}"):
+        try:
+            rtdb.reference(path).delete()
+        except Exception:
+            pass
+
     return {"status": "signed_out_all"}
 
 
@@ -800,6 +808,11 @@ def delete_account(user=Depends(verify_firebase_user)):
         rtdb.reference(f"usernames/{rtdb_safe_key(username)}").delete()
     rtdb.reference(f"users/{user_node(uid)}").delete()
     rtdb.reference(f"signup_verified/{user_node(uid)}").delete()
+    for path in (f"fcm/{_push_key(uid)}", f"push/{_push_key(uid)}", f"pushlog/{_push_key(uid)}"):
+        try:
+            rtdb.reference(path).delete()
+        except Exception:
+            pass
 
     return {"status": "deleted", "messages": deleted}
 
@@ -814,9 +827,15 @@ def forgot_password(payload: ForgotPasswordRequest):
     eyemail_address = f"{username}@{DOMAIN_NAME}"
     safe_user = rtdb_safe_key(username)
 
+    # Answering "no such account" would let a stranger test addresses one by one.
+    # The answer is the same whether the address exists or not.
     uid = resolve_uid(rtdb.reference(f"usernames/{safe_user}").get())
     if not uid:
-        raise HTTPException(status_code=404, detail=f"No Eyemail account found for {eyemail_address}")
+        return {
+            "status": "sent",
+            "maskedRecoveryEmail": "",
+            "detail": f"If {eyemail_address} exists, a reset link has been sent to its recovery email.",
+        }
 
     take_slot(f"limits/forgot/{user_node(uid)}", max_count=3, window_seconds=3600)
 
