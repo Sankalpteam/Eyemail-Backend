@@ -2,9 +2,7 @@ import os
 import json
 import re
 import time
-import hashlib
 import secrets
-import json as _json
 from email import policy
 from email.parser import Parser
 from email.utils import parseaddr
@@ -1148,115 +1146,7 @@ async def inbound_email_webhook(request: Request, x_webhook_secret: str = Header
     })
     target_user_ref.update({"storageUsedBytes": target_used + msg_size})
 
-    # A notification, but only for real mail, never for something filed as junk.
-    if target_folder == "inbox":
-        try:
-            send_web_push(
-                target_uid,
-                sender_name or sender_email,
-                subject or "(no subject)",
-            )
-        except Exception:
-            # A failed notification must never cost the mail itself.
-            pass
-
     return {"status": "received", "to": to_email}
-
-
-# ==============================================================================
-# 6b. WEB PUSH (a notification when mail arrives, app closed)
-# ==============================================================================
-VAPID_PUBLIC_KEY = os.getenv("VAPID_PUBLIC_KEY", "").strip()
-VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", "").strip()
-VAPID_SUBJECT = os.getenv("VAPID_SUBJECT", "mailto:hello@eyemail.in").strip()
-
-
-class PushSubscriptionRequest(BaseModel):
-    endpoint: str
-    p256dh: str
-    auth: str
-
-
-def push_enabled() -> bool:
-    return bool(VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY)
-
-
-def _push_key(uid: str) -> str:
-    return hashlib.sha256(uid.encode("utf-8")).hexdigest()[:32]
-
-
-def send_web_push(uid: str, title: str, body: str, url: str = "/web/app.html") -> int:
-    """One notification to every browser this account subscribed. Returns how many went."""
-    if not push_enabled():
-        return 0
-    try:
-        from pywebpush import webpush, WebPushException
-    except Exception:
-        return 0
-
-    node = user_node(uid)
-    stored = rtdb.reference(f"push/{_push_key(uid)}").get() or {}
-    if not isinstance(stored, dict) or not stored:
-        return 0
-
-    payload = _json.dumps({"title": title, "body": body, "url": url})
-    sent = 0
-    for key, sub in list(stored.items()):
-        if not isinstance(sub, dict):
-            continue
-        info = {
-            "endpoint": sub.get("endpoint", ""),
-            "keys": {"p256dh": sub.get("p256dh", ""), "auth": sub.get("auth", "")},
-        }
-        if not info["endpoint"] or not info["keys"]["p256dh"]:
-            continue
-        try:
-            webpush(
-                subscription_info=info,
-                data=payload,
-                vapid_private_key=VAPID_PRIVATE_KEY,
-                vapid_claims={"sub": VAPID_SUBJECT},
-            )
-            sent += 1
-        except WebPushException as exc:
-            # 404 or 410 means the browser threw the subscription away; stop keeping it.
-            status = getattr(getattr(exc, "response", None), "status_code", None)
-            if status in (404, 410):
-                try:
-                    rtdb.reference(f"push/{_push_key(uid)}/{key}").delete()
-                except Exception:
-                    pass
-        except Exception:
-            continue
-    return sent
-
-
-@app.get("/api/push/public-key")
-def push_public_key():
-    """The browser needs this to subscribe. It is public by design."""
-    if not push_enabled():
-        raise HTTPException(status_code=503, detail="Push is not configured on the server yet.")
-    return {"key": VAPID_PUBLIC_KEY}
-
-
-@app.post("/api/push/subscribe")
-def push_subscribe(payload: PushSubscriptionRequest, user=Depends(verify_firebase_user)):
-    if not push_enabled():
-        raise HTTPException(status_code=503, detail="Push is not configured on the server yet.")
-    if not payload.endpoint.startswith("https://"):
-        raise HTTPException(status_code=400, detail="That subscription does not look right.")
-    key = hashlib.sha256(payload.endpoint.encode("utf-8")).hexdigest()[:24]
-    rtdb.reference(f"push/{_push_key(user['uid'])}/{key}").set(
-        {"endpoint": payload.endpoint, "p256dh": payload.p256dh, "auth": payload.auth}
-    )
-    return {"status": "subscribed"}
-
-
-@app.post("/api/push/unsubscribe")
-def push_unsubscribe(payload: PushSubscriptionRequest, user=Depends(verify_firebase_user)):
-    key = hashlib.sha256(payload.endpoint.encode("utf-8")).hexdigest()[:24]
-    rtdb.reference(f"push/{_push_key(user['uid'])}/{key}").delete()
-    return {"status": "unsubscribed"}
 
 
 # ==============================================================================
@@ -1285,7 +1175,7 @@ def internal_send_mail(payload: InternalSendMailRequest, _=Depends(verify_intern
         _used, _limit, target_full = storage_state(target_profile)
         if target_full:
             raise HTTPException(status_code=507, detail="Recipient mailbox is full.")
-        stored = fs_db.collection("users").document(target_uid).collection("emails").add({
+        fs_db.collection("users").document(target_uid).collection("emails").add({
             "from": f"noreply@{DOMAIN_NAME}",
             "fromName": sender_name,
             "to": to_email,
