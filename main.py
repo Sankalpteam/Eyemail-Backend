@@ -249,8 +249,8 @@ def take_slot(path: str, max_count: int, window_seconds: int) -> None:
         print(f"[limit] could not record {path}", flush=True)
 
 
-def count_daily(path: str, daily_limit: int) -> int:
-    """Add one to today's counter, or refuse when the day is full."""
+def count_daily(path: str, daily_limit: int, dry_run: bool = False) -> int:
+    """Check the day's counter, or add one to it. dry_run asks without counting."""
     ref = rtdb.reference(path)
 
     def bump(current):
@@ -258,7 +258,7 @@ def count_daily(path: str, daily_limit: int) -> int:
         used = int(current.get("externalSent", 0))
         if used >= daily_limit:
             raise RateLimited(60)
-        return {"externalSent": used + 1}
+        return {"externalSent": used + (0 if dry_run else 1)}
 
     try:
         ref.transaction(bump)
@@ -1008,9 +1008,12 @@ def send_email(payload: SendEmailRequest, user=Depends(verify_firebase_user)):
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     # One person cannot send faster than this, whatever the daily allowance.
     take_slot(f"limits/send/{user_node(uid)}", max_count=30, window_seconds=60)
-    count_daily(f"usage/{user_node(uid)}/{today_str}", daily_limit)
+    # Ask first whether the day is already full, then count only after the mail left.
+    # Counting before the send meant a Brevo failure burned one of the fifty for nothing.
+    count_daily(f"usage/{user_node(uid)}/{today_str}", daily_limit, dry_run=True)
 
     send_via_brevo(sender_name, sender_email, to_email, subject, body, cc=cc_list, bcc=bcc_list)
+    count_daily(f"usage/{user_node(uid)}/{today_str}", daily_limit)
 
     store_message(uid, "sent", True, to_email)
     user_ref.update({"storageUsedBytes": current_used + msg_size})
