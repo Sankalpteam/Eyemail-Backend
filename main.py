@@ -7,7 +7,7 @@ import secrets
 import json as _json
 from email import policy
 from email.parser import Parser
-from email.utils import parseaddr
+from email.utils import parseaddr, getaddresses
 from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Header, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -933,6 +933,7 @@ def send_email(payload: SendEmailRequest, user=Depends(verify_firebase_user)):
             "fromName": sender_name,
             "to": recipient,
             "cc": cc_list,
+            "ccText": ", ".join(cc_list),
             "bcc": bcc_list if folder == "sent" else [],
             "subject": subject,
             "body": body,
@@ -966,11 +967,22 @@ def send_email(payload: SendEmailRequest, user=Depends(verify_firebase_user)):
             store_message(target_uid, "inbox", False, addr)
             target_user_ref.update({"storageUsedBytes": target_used + msg_size})
 
+            # A mail from another Eyemail user is still mail: it must buzz the phone.
+            try:
+                send_web_push(target_uid, sender_name or sender_email, subject)
+            except Exception:
+                pass
+            try:
+                send_fcm(target_uid, sender_name or sender_email, subject)
+            except Exception:
+                pass
+
         store_message(uid, "sent", True, to_email)
         user_ref.update({"storageUsedBytes": current_used + msg_size})
 
         return {"status": "sent", "delivery": "internal", "to": to_email,
-                "cc": cc_list, "bcc": bcc_list}
+                "cc": cc_list,
+            "ccText": ", ".join(cc_list), "bcc": bcc_list}
 
     # CASE B: at least one external recipient -> Brevo
     daily_limit = PAID_DAILY_EXTERNAL_LIMIT if user_plan != "free" else FREE_DAILY_EXTERNAL_LIMIT
@@ -985,7 +997,8 @@ def send_email(payload: SendEmailRequest, user=Depends(verify_firebase_user)):
     user_ref.update({"storageUsedBytes": current_used + msg_size})
 
     return {"status": "sent", "delivery": "brevo", "to": to_email,
-            "cc": cc_list, "bcc": bcc_list}
+            "cc": cc_list,
+            "ccText": ", ".join(cc_list), "bcc": bcc_list}
 
 
 # ==============================================================================
@@ -1083,6 +1096,7 @@ async def inbound_email_webhook(request: Request, x_webhook_secret: str = Header
     subject = (data.get("subject") or "(No Subject)").strip()
     body = (data.get("text") or data.get("body") or "").strip()
 
+    incoming_cc = []
     if raw_email:
         try:
             msg = Parser(policy=policy.default).parsestr(raw_email)
@@ -1093,6 +1107,14 @@ async def inbound_email_webhook(request: Request, x_webhook_secret: str = Header
                 sender_email = hdr_addr.strip().lower()
             if msg.get("Subject"):
                 subject = msg.get("Subject").strip() or subject
+            if msg.get("Cc"):
+                incoming_cc = [
+                    addr.strip().lower()
+                    for _, addr in getaddresses([msg.get("Cc", "")])
+                    if addr and "@" in addr
+                ]
+            else:
+                incoming_cc = []
 
             extracted_text = ""
             if msg.is_multipart():
@@ -1111,6 +1133,15 @@ async def inbound_email_webhook(request: Request, x_webhook_secret: str = Header
 
     if not body:
         body = "(Empty message)"
+
+    # Firestore refuses a document over 1 MB, and a refused document is a lost mail.
+    # A long mail is cut and labelled, which is honest and keeps the rest.
+    limit_bytes = 900_000
+    truncated = False
+    if len(body.encode("utf-8")) > limit_bytes:
+        body = body.encode("utf-8")[:limit_bytes].decode("utf-8", "ignore")
+        body += "\n\n[This mail was longer than the mailbox accepts. The rest was not stored.]"
+        truncated = True
 
     if not to_email or not to_email.endswith(f"@{DOMAIN_NAME}"):
         raise HTTPException(status_code=400, detail="Invalid recipient domain")
@@ -1142,6 +1173,8 @@ async def inbound_email_webhook(request: Request, x_webhook_secret: str = Header
         "to": to_email,
         "subject": subject,
         "body": body,
+        "cc": incoming_cc,
+        "ccText": ", ".join(incoming_cc),
         "snippet": snippet,
         "folder": target_folder,
         "read": False,
@@ -1149,6 +1182,7 @@ async def inbound_email_webhook(request: Request, x_webhook_secret: str = Header
         "timestamp": firestore.SERVER_TIMESTAMP,
         "createdAt": now_iso,
         **({"spamScore": score, "spamReasons": reasons} if target_folder == "spam" else {}),
+        **({"truncated": True} if truncated else {}),
     })
     target_user_ref.update({"storageUsedBytes": target_used + msg_size})
 
