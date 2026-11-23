@@ -1154,19 +1154,15 @@ async def inbound_email_webhook(request: Request, x_webhook_secret: str = Header
 
     # A notification, but only for real mail, never for something filed as junk.
     if target_folder == "inbox":
+        # Each channel is tried on its own: a browser push that fails must never
+        # stop the phone from being told, and vice versa.
         try:
-            send_web_push(
-                target_uid,
-                sender_name or sender_email,
-                subject or "(no subject)",
-            )
-            send_fcm(
-                target_uid,
-                sender_name or sender_email,
-                subject or "(no subject)",
-            )
+            send_web_push(target_uid, sender_name or sender_email, subject or "(no subject)")
         except Exception:
-            # A failed notification must never cost the mail itself.
+            pass
+        try:
+            send_fcm(target_uid, sender_name or sender_email, subject or "(no subject)")
+        except Exception:
             pass
 
     return {"status": "received", "to": to_email}
