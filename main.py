@@ -169,6 +169,16 @@ def rtdb_safe_key(text: str) -> str:
     return text.strip().lower().replace(".", ",")
 
 
+def push_path(uid: str, tail: str = "") -> str:
+    """Everything about notifications for one person lives under their own record."""
+    return f"users/{user_node(uid)}/push" + (f"/{tail}" if tail else "")
+
+
+def usage_path(uid: str, tail: str = "") -> str:
+    """Daily counts and rate counters belong to the person they count."""
+    return f"users/{user_node(uid)}/usage" + (f"/{tail}" if tail else "")
+
+
 def user_node(uid: str) -> str:
     """Realtime Database keys cannot contain dots, so users/<email> is stored as
     users/<email with , instead of .>. The uid itself stays the plain address."""
@@ -560,7 +570,7 @@ def send_signup_otp(payload: SignupOtpRequest, user=Depends(verify_firebase_user
     last_sent = int(previous.get("sentAt", 0))
     if last_sent and now - last_sent < 60:
         raise HTTPException(status_code=429, detail=f"Please wait {60 - (now - last_sent)}s before asking for another code.")
-    take_slot(f"limits/otp/{user_node(uid)}", max_count=10, window_seconds=3600)
+    take_slot(usage_path(uid, "limits/otp"), max_count=10, window_seconds=3600)
 
     otp_code = f"{secrets.randbelow(900000) + 100000}"
     otp_ref.set({
@@ -707,7 +717,7 @@ def send_recovery_otp(payload: RecoveryEmailRequest, user=Depends(verify_firebas
     if new_email == (profile.get("recoveryEmail") or "").strip().lower():
         raise HTTPException(status_code=400, detail="That is already your recovery email.")
 
-    take_slot(f"limits/recovery/{user_node(uid)}", max_count=3, window_seconds=3600)
+    take_slot(usage_path(uid, "limits/recovery"), max_count=3, window_seconds=3600)
 
     now = int(time.time())
     code = f"{secrets.randbelow(900000) + 100000}"
@@ -768,7 +778,7 @@ def sign_out_all(user=Depends(verify_firebase_user)):
         raise HTTPException(status_code=500, detail="Could not end the other sessions.")
 
     # The phones must stop buzzing too, or "signed out everywhere" is only half true.
-    for path in (f"fcm/{_push_key(uid)}", f"push/{_push_key(uid)}"):
+    for path in (push_path(uid, "fcm"), push_path(uid, "web")):
         try:
             rtdb.reference(path).delete()
         except Exception:
@@ -808,7 +818,7 @@ def delete_account(user=Depends(verify_firebase_user)):
         rtdb.reference(f"usernames/{rtdb_safe_key(username)}").delete()
     rtdb.reference(f"users/{user_node(uid)}").delete()
     rtdb.reference(f"signup_verified/{user_node(uid)}").delete()
-    for path in (f"fcm/{_push_key(uid)}", f"push/{_push_key(uid)}", f"pushlog/{_push_key(uid)}"):
+    for path in (push_path(uid, "fcm"), push_path(uid, "web"), push_path(uid, "last")):
         try:
             rtdb.reference(path).delete()
         except Exception:
@@ -837,7 +847,7 @@ def forgot_password(payload: ForgotPasswordRequest):
             "detail": f"If {eyemail_address} exists, a reset link has been sent to its recovery email.",
         }
 
-    take_slot(f"limits/forgot/{user_node(uid)}", max_count=3, window_seconds=3600)
+    take_slot(usage_path(uid, "limits/forgot"), max_count=3, window_seconds=3600)
 
     profile = rtdb.reference(f"users/{user_node(uid)}").get() or {}
     recovery_email = (profile.get("recoveryEmail") or "").strip().lower()
@@ -891,8 +901,10 @@ def add_business_domain(payload: AddBusinessDomainRequest, user=Depends(verify_f
             {"type": "TXT", "host": "@", "value": "v=spf1 include:spf.brevo.com ~all", "status": "pending"}
         ]
     }
-    dom_ref.set(domain_record)
-    rtdb.reference(f"users/{user_node(uid)}/domains/{safe_dom}").set({"domain": domain, "verified": False})
+    # The record itself lives inside the person's own node, one place.
+    rtdb.reference(f"users/{user_node(uid)}/domains/{safe_dom}").set(domain_record)
+    # The top level keeps one line: which person owns this domain. A pointer, not a copy.
+    dom_ref.set({"ownerUid": uid})
 
     return {"status": "added", "domainInfo": domain_record}
 
@@ -1007,13 +1019,13 @@ def send_email(payload: SendEmailRequest, user=Depends(verify_firebase_user)):
     daily_limit = PAID_DAILY_EXTERNAL_LIMIT if user_plan != "free" else FREE_DAILY_EXTERNAL_LIMIT
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     # One person cannot send faster than this, whatever the daily allowance.
-    take_slot(f"limits/send/{user_node(uid)}", max_count=30, window_seconds=60)
+    take_slot(usage_path(uid, "limits/send"), max_count=30, window_seconds=60)
     # Ask first whether the day is already full, then count only after the mail left.
     # Counting before the send meant a Brevo failure burned one of the fifty for nothing.
-    count_daily(f"usage/{user_node(uid)}/{today_str}", daily_limit, dry_run=True)
+    count_daily(usage_path(uid, f"daily/{today_str}"), daily_limit, dry_run=True)
 
     send_via_brevo(sender_name, sender_email, to_email, subject, body, cc=cc_list, bcc=bcc_list)
-    count_daily(f"usage/{user_node(uid)}/{today_str}", daily_limit)
+    count_daily(usage_path(uid, f"daily/{today_str}"), daily_limit)
 
     store_message(uid, "sent", True, to_email)
     user_ref.update({"storageUsedBytes": current_used + msg_size})
@@ -1223,7 +1235,7 @@ async def inbound_email_webhook(request: Request, x_webhook_secret: str = Header
             pass
         # Remember what happened for this mail, so "why no notification" has an answer.
         try:
-            rtdb.reference(f"pushlog/{_push_key(target_uid)}").set({
+            rtdb.reference(push_path(target_uid, "last")).set({
                 "at": now_iso,
                 "subject": subject or "(no subject)",
                 "fcmSent": fcm_sent,
@@ -1267,7 +1279,7 @@ def send_web_push(uid: str, title: str, body: str, url: str = "/web/app.html") -
         return 0
 
     node = user_node(uid)
-    stored = rtdb.reference(f"push/{_push_key(uid)}").get() or {}
+    stored = rtdb.reference(push_path(uid, "web")).get() or {}
     if not isinstance(stored, dict) or not stored:
         return 0
 
@@ -1295,7 +1307,7 @@ def send_web_push(uid: str, title: str, body: str, url: str = "/web/app.html") -
             status = getattr(getattr(exc, "response", None), "status_code", None)
             if status in (404, 410):
                 try:
-                    rtdb.reference(f"push/{_push_key(uid)}/{key}").delete()
+                    rtdb.reference(push_path(uid, f"web/{key}")).delete()
                 except Exception:
                     pass
         except Exception:
@@ -1311,7 +1323,7 @@ def send_fcm(uid: str, title: str, body: str) -> int:
     """One notification to every phone this account registered. Returns how many went."""
     if messaging is None:
         return 0
-    tokens = rtdb.reference(f"fcm/{_push_key(uid)}").get() or {}
+    tokens = rtdb.reference(push_path(uid, "fcm")).get() or {}
     if not isinstance(tokens, dict) or not tokens:
         return 0
     sent = 0
@@ -1343,7 +1355,7 @@ def send_fcm(uid: str, title: str, body: str) -> int:
             # A token the phone threw away should not be kept forever.
             if "not registered" in text.lower() or "invalid" in text.lower():
                 try:
-                    rtdb.reference(f"fcm/{_push_key(uid)}/{key}").delete()
+                    rtdb.reference(push_path(uid, f"fcm/{key}")).delete()
                 except Exception:
                     pass
     return sent
@@ -1355,15 +1367,15 @@ def fcm_subscribe(payload: FcmTokenRequest, user=Depends(verify_firebase_user)):
     if not token:
         raise HTTPException(status_code=400, detail="No token was sent.")
     key = hashlib.sha256(token.encode("utf-8")).hexdigest()[:24]
-    rtdb.reference(f"fcm/{_push_key(user['uid'])}/{key}").set(token)
+    rtdb.reference(push_path(user["uid"], f"fcm/{key}")).set(token)
     return {"status": "subscribed"}
 
 
 @app.get("/api/push/last-status")
 def push_last_status(user=Depends(verify_firebase_user)):
     """What happened the last time real mail arrived, for this account."""
-    record = rtdb.reference(f"pushlog/{_push_key(user['uid'])}").get() or {}
-    phones = rtdb.reference(f"fcm/{_push_key(user['uid'])}").get() or {}
+    record = rtdb.reference(push_path(user["uid"], "last")).get() or {}
+    phones = rtdb.reference(push_path(user["uid"], "fcm")).get() or {}
     if not isinstance(record, dict):
         record = {}
     return {
@@ -1380,7 +1392,7 @@ def fcm_test(user=Depends(verify_firebase_user)):
     """Send one notification to the caller's own phones, and say exactly what happened."""
     if messaging is None:
         return {"tokens": 0, "sent": 0, "error": "This server has no messaging library."}
-    tokens = rtdb.reference(f"fcm/{_push_key(user['uid'])}").get() or {}
+    tokens = rtdb.reference(push_path(user["uid"], "fcm")).get() or {}
     if not isinstance(tokens, dict) or not tokens:
         return {"tokens": 0, "sent": 0, "error": "No phone registered for this account."}
 
@@ -1419,7 +1431,7 @@ def fcm_test(user=Depends(verify_firebase_user)):
 @app.post("/api/push/fcm-unsubscribe")
 def fcm_unsubscribe(payload: FcmTokenRequest, user=Depends(verify_firebase_user)):
     key = hashlib.sha256(payload.token.strip().encode("utf-8")).hexdigest()[:24]
-    rtdb.reference(f"fcm/{_push_key(user['uid'])}/{key}").delete()
+    rtdb.reference(push_path(user["uid"], f"fcm/{key}")).delete()
     return {"status": "unsubscribed"}
 
 
@@ -1438,7 +1450,7 @@ def push_subscribe(payload: PushSubscriptionRequest, user=Depends(verify_firebas
     if not payload.endpoint.startswith("https://"):
         raise HTTPException(status_code=400, detail="That subscription does not look right.")
     key = hashlib.sha256(payload.endpoint.encode("utf-8")).hexdigest()[:24]
-    rtdb.reference(f"push/{_push_key(user['uid'])}/{key}").set(
+    rtdb.reference(push_path(user["uid"], f"web/{key}")).set(
         {"endpoint": payload.endpoint, "p256dh": payload.p256dh, "auth": payload.auth}
     )
     return {"status": "subscribed"}
@@ -1447,7 +1459,7 @@ def push_subscribe(payload: PushSubscriptionRequest, user=Depends(verify_firebas
 @app.post("/api/push/unsubscribe")
 def push_unsubscribe(payload: PushSubscriptionRequest, user=Depends(verify_firebase_user)):
     key = hashlib.sha256(payload.endpoint.encode("utf-8")).hexdigest()[:24]
-    rtdb.reference(f"push/{_push_key(user['uid'])}/{key}").delete()
+    rtdb.reference(push_path(user["uid"], f"web/{key}")).delete()
     return {"status": "unsubscribed"}
 
 
