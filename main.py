@@ -1322,12 +1322,18 @@ def send_fcm(uid: str, title: str, body: str) -> int:
             messaging.send(
                 messaging.Message(
                     token=token,
-                    # Data only, on purpose: a notification block lets Android draw the
-                    # message through a channel it picks, which some phones suppress.
+                    # Both, on purpose. The notification block is what the system draws
+                    # when the app is closed, and it names our channel so it cannot be
+                    # hidden in a channel nobody chose. The data copy is what the app
+                    # draws when it is open. The app never draws twice.
+                    notification=messaging.Notification(title=title, body=body),
                     data={"title": title, "body": body},
                     android=messaging.AndroidConfig(
                         priority="high",
-                        notification=messaging.AndroidNotification(channel_id="eyemail_mail"),
+                        notification=messaging.AndroidNotification(
+                            channel_id="eyemail_mail",
+                            icon="ic_stat_mail",
+                        ),
                     ),
                 )
             )
@@ -1387,13 +1393,20 @@ def fcm_test(user=Depends(verify_firebase_user)):
             messaging.send(
                 messaging.Message(
                     token=token,
+                    notification=messaging.Notification(
+                        title="Eyemail test",
+                        body="If you can read this, push works on this phone.",
+                    ),
                     data={
                         "title": "Eyemail test",
                         "body": "If you can read this, push works on this phone.",
                     },
                     android=messaging.AndroidConfig(
                         priority="high",
-                        notification=messaging.AndroidNotification(channel_id="eyemail_mail"),
+                        notification=messaging.AndroidNotification(
+                            channel_id="eyemail_mail",
+                            icon="ic_stat_mail",
+                        ),
                     ),
                 )
             )
