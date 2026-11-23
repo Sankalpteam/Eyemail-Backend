@@ -1156,12 +1156,23 @@ async def inbound_email_webhook(request: Request, x_webhook_secret: str = Header
     if target_folder == "inbox":
         # Each channel is tried on its own: a browser push that fails must never
         # stop the phone from being told, and vice versa.
+        fcm_sent, fcm_error = 0, ""
+        try:
+            fcm_sent = send_fcm(target_uid, sender_name or sender_email, subject or "(no subject)")
+        except Exception as exc:
+            fcm_error = str(exc)[:200]
         try:
             send_web_push(target_uid, sender_name or sender_email, subject or "(no subject)")
         except Exception:
             pass
+        # Remember what happened for this mail, so "why no notification" has an answer.
         try:
-            send_fcm(target_uid, sender_name or sender_email, subject or "(no subject)")
+            rtdb.reference(f"pushlog/{_push_key(target_uid)}").set({
+                "at": now_iso,
+                "subject": subject or "(no subject)",
+                "fcmSent": fcm_sent,
+                "fcmError": fcm_error,
+            })
         except Exception:
             pass
 
@@ -1280,6 +1291,22 @@ def fcm_subscribe(payload: FcmTokenRequest, user=Depends(verify_firebase_user)):
     key = hashlib.sha256(token.encode("utf-8")).hexdigest()[:24]
     rtdb.reference(f"fcm/{_push_key(user['uid'])}/{key}").set(token)
     return {"status": "subscribed"}
+
+
+@app.get("/api/push/last-status")
+def push_last_status(user=Depends(verify_firebase_user)):
+    """What happened the last time real mail arrived, for this account."""
+    record = rtdb.reference(f"pushlog/{_push_key(user['uid'])}").get() or {}
+    phones = rtdb.reference(f"fcm/{_push_key(user['uid'])}").get() or {}
+    if not isinstance(record, dict):
+        record = {}
+    return {
+        "at": record.get("at", ""),
+        "subject": record.get("subject", ""),
+        "fcmSent": record.get("fcmSent", 0),
+        "fcmError": record.get("fcmError", ""),
+        "phones": len(phones) if isinstance(phones, dict) else 0,
+    }
 
 
 @app.post("/api/push/fcm-test")
