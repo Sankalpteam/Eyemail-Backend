@@ -15,6 +15,10 @@ from typing import List
 from pydantic import BaseModel, EmailStr, Field
 import requests
 import firebase_admin
+try:  # the messaging module is what FCM needs; absent, push simply stays off
+    from firebase_admin import messaging
+except Exception:  # pragma: no cover
+    messaging = None
 from firebase_admin import credentials, auth, firestore, db as rtdb
 
 # 1. Initialize Firebase Admin SDK (Realtime Database + Cloud Firestore)
@@ -1156,6 +1160,11 @@ async def inbound_email_webhook(request: Request, x_webhook_secret: str = Header
                 sender_name or sender_email,
                 subject or "(no subject)",
             )
+            send_fcm(
+                target_uid,
+                sender_name or sender_email,
+                subject or "(no subject)",
+            )
         except Exception:
             # A failed notification must never cost the mail itself.
             pass
@@ -1229,6 +1238,59 @@ def send_web_push(uid: str, title: str, body: str, url: str = "/web/app.html") -
         except Exception:
             continue
     return sent
+
+
+class FcmTokenRequest(BaseModel):
+    token: str
+
+
+def send_fcm(uid: str, title: str, body: str) -> int:
+    """One notification to every phone this account registered. Returns how many went."""
+    if messaging is None:
+        return 0
+    tokens = rtdb.reference(f"fcm/{_push_key(uid)}").get() or {}
+    if not isinstance(tokens, dict) or not tokens:
+        return 0
+    sent = 0
+    for key, token in list(tokens.items()):
+        if not isinstance(token, str) or not token:
+            continue
+        try:
+            messaging.send(
+                messaging.Message(
+                    token=token,
+                    notification=messaging.Notification(title=title, body=body),
+                    data={"title": title, "body": body},
+                    android=messaging.AndroidConfig(priority="high"),
+                )
+            )
+            sent += 1
+        except Exception as exc:
+            text = str(exc)
+            # A token the phone threw away should not be kept forever.
+            if "not registered" in text.lower() or "invalid" in text.lower():
+                try:
+                    rtdb.reference(f"fcm/{_push_key(uid)}/{key}").delete()
+                except Exception:
+                    pass
+    return sent
+
+
+@app.post("/api/push/fcm-subscribe")
+def fcm_subscribe(payload: FcmTokenRequest, user=Depends(verify_firebase_user)):
+    token = payload.token.strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="No token was sent.")
+    key = hashlib.sha256(token.encode("utf-8")).hexdigest()[:24]
+    rtdb.reference(f"fcm/{_push_key(user['uid'])}/{key}").set(token)
+    return {"status": "subscribed"}
+
+
+@app.post("/api/push/fcm-unsubscribe")
+def fcm_unsubscribe(payload: FcmTokenRequest, user=Depends(verify_firebase_user)):
+    key = hashlib.sha256(payload.token.strip().encode("utf-8")).hexdigest()[:24]
+    rtdb.reference(f"fcm/{_push_key(user['uid'])}/{key}").delete()
+    return {"status": "unsubscribed"}
 
 
 @app.get("/api/push/public-key")
