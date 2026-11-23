@@ -1286,6 +1286,38 @@ def fcm_subscribe(payload: FcmTokenRequest, user=Depends(verify_firebase_user)):
     return {"status": "subscribed"}
 
 
+@app.post("/api/push/fcm-test")
+def fcm_test(user=Depends(verify_firebase_user)):
+    """Send one notification to the caller's own phones, and say exactly what happened."""
+    if messaging is None:
+        return {"tokens": 0, "sent": 0, "error": "This server has no messaging library."}
+    tokens = rtdb.reference(f"fcm/{_push_key(user['uid'])}").get() or {}
+    if not isinstance(tokens, dict) or not tokens:
+        return {"tokens": 0, "sent": 0, "error": "No phone registered for this account."}
+
+    sent = 0
+    error = ""
+    for key, token in list(tokens.items()):
+        if not isinstance(token, str) or not token:
+            continue
+        try:
+            messaging.send(
+                messaging.Message(
+                    token=token,
+                    notification=messaging.Notification(
+                        title="Eyemail test",
+                        body="If you can read this, push works on this phone.",
+                    ),
+                    data={"title": "Eyemail test", "body": "Push works on this phone."},
+                    android=messaging.AndroidConfig(priority="high"),
+                )
+            )
+            sent += 1
+        except Exception as exc:
+            error = str(exc)[:300]
+    return {"tokens": len(tokens), "sent": sent, "error": error}
+
+
 @app.post("/api/push/fcm-unsubscribe")
 def fcm_unsubscribe(payload: FcmTokenRequest, user=Depends(verify_firebase_user)):
     key = hashlib.sha256(payload.token.strip().encode("utf-8")).hexdigest()[:24]
