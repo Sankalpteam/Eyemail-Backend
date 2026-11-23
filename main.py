@@ -1266,9 +1266,13 @@ def send_fcm(uid: str, title: str, body: str) -> int:
             messaging.send(
                 messaging.Message(
                     token=token,
-                    notification=messaging.Notification(title=title, body=body),
+                    # Data only, on purpose: a notification block lets Android draw the
+                    # message through a channel it picks, which some phones suppress.
                     data={"title": title, "body": body},
-                    android=messaging.AndroidConfig(priority="high"),
+                    android=messaging.AndroidConfig(
+                        priority="high",
+                        notification=messaging.AndroidNotification(channel_id="eyemail_mail"),
+                    ),
                 )
             )
             sent += 1
@@ -1327,12 +1331,14 @@ def fcm_test(user=Depends(verify_firebase_user)):
             messaging.send(
                 messaging.Message(
                     token=token,
-                    notification=messaging.Notification(
-                        title="Eyemail test",
-                        body="If you can read this, push works on this phone.",
+                    data={
+                        "title": "Eyemail test",
+                        "body": "If you can read this, push works on this phone.",
+                    },
+                    android=messaging.AndroidConfig(
+                        priority="high",
+                        notification=messaging.AndroidNotification(channel_id="eyemail_mail"),
                     ),
-                    data={"title": "Eyemail test", "body": "Push works on this phone."},
-                    android=messaging.AndroidConfig(priority="high"),
                 )
             )
             sent += 1
