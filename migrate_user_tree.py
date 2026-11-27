@@ -92,6 +92,18 @@ def main() -> None:
             put(f"users/{name}/{into}", value)
             drop(f"usage/{name}")
 
+    # 2b. the two old signup staging branches become one
+    otps = rtdb.reference("signup_otps").get() or {}
+    if isinstance(otps, dict):
+        for uid_key, value in otps.items():
+            put(f"pending/{uid_key}/otp", value)
+            drop(f"signup_otps/{uid_key}")
+    verified = rtdb.reference("signup_verified").get() or {}
+    if isinstance(verified, dict):
+        for uid_key, value in verified.items():
+            put(f"pending/{uid_key}/verified", value)
+            drop(f"signup_verified/{uid_key}")
+
     # 3. domains: the record moves into the owner, the top level keeps the owner only
     domains = rtdb.reference("domains").get() or {}
     if isinstance(domains, dict):

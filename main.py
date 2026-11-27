@@ -169,6 +169,15 @@ def rtdb_safe_key(text: str) -> str:
     return text.strip().lower().replace(".", ",")
 
 
+def pending_path(uid: str, tail: str = "") -> str:
+    """A signup that has not become an account yet: the code and the verified flag.
+
+    It cannot live under users/, because writing there is what makes an account exist.
+    One branch, two keys, deleted the moment the mailbox is created.
+    """
+    return f"pending/{user_node(uid)}" + (f"/{tail}" if tail else "")
+
+
 def push_path(uid: str, tail: str = "") -> str:
     """Everything about notifications for one person lives under their own record."""
     return f"users/{user_node(uid)}/push" + (f"/{tail}" if tail else "")
@@ -382,11 +391,11 @@ def register_mailbox(payload: RegisterMailboxRequest, user=Depends(verify_fireba
         return {"status": "exists", "profile": existing_user}
 
     # The recovery address must be proven before the mailbox is created.
-    verified = rtdb.reference(f"signup_verified/{user_node(uid)}").get()
+    verified = rtdb.reference(pending_path(uid, "verified")).get()
     if not verified:
         raise HTTPException(status_code=403, detail="Verify your recovery email first.")
     if int(time.time()) > int(verified.get("expiresAt", 0)):
-        rtdb.reference(f"signup_verified/{user_node(uid)}").delete()
+        rtdb.reference(f"pending/{user_node(uid)}").delete()
         raise HTTPException(status_code=403, detail="Verification expired. Please verify again.")
     if (verified.get("recoveryEmail") or "").lower() != recovery_email:
         raise HTTPException(status_code=400, detail="Recovery email does not match the one you verified.")
@@ -435,7 +444,8 @@ def register_mailbox(payload: RegisterMailboxRequest, user=Depends(verify_fireba
         "createdAt": now_iso,
     })
 
-    rtdb.reference(f"signup_verified/{user_node(uid)}").delete()
+    # The account exists now, so nothing about the signup is needed any more.
+    rtdb.reference(f"pending/{user_node(uid)}").delete()
 
     return {"status": "created", "profile": profile_data}
 
@@ -525,7 +535,7 @@ def public_signup(payload: PublicSignupRequest):
 
     now = int(time.time())
     otp_code = f"{secrets.randbelow(900000) + 100000}"
-    otp_ref = rtdb.reference(f"signup_otps/{user_node(eyemail_address)}")
+    otp_ref = rtdb.reference(pending_path(eyemail_address, "otp"))
     otp_ref.set({
         "otp": otp_code,
         "recoveryEmail": recovery_email,
@@ -563,7 +573,7 @@ def send_signup_otp(payload: SignupOtpRequest, user=Depends(verify_firebase_user
         raise HTTPException(status_code=409, detail="This account is already registered. Please sign in.")
 
     recovery_email = payload.recovery_email.strip().lower()
-    otp_ref = rtdb.reference(f"signup_otps/{user_node(uid)}")
+    otp_ref = rtdb.reference(pending_path(uid, "otp"))
     previous = otp_ref.get() or {}
     now = int(time.time())
 
@@ -602,7 +612,7 @@ def send_signup_otp(payload: SignupOtpRequest, user=Depends(verify_firebase_user
 def verify_signup_otp(payload: VerifySignupOtpRequest, user=Depends(verify_firebase_user)):
     uid = user["uid"]
     entered = payload.otp.strip()
-    otp_ref = rtdb.reference(f"signup_otps/{user_node(uid)}")
+    otp_ref = rtdb.reference(pending_path(uid, "otp"))
     record = otp_ref.get()
 
     if not record:
@@ -621,7 +631,7 @@ def verify_signup_otp(payload: VerifySignupOtpRequest, user=Depends(verify_fireb
         raise HTTPException(status_code=400, detail="That code is not correct.")
 
     now = int(time.time())
-    rtdb.reference(f"signup_verified/{user_node(uid)}").set({
+    rtdb.reference(pending_path(uid, "verified")).set({
         "recoveryEmail": record.get("recoveryEmail", ""),
         "verifiedAt": now,
         "expiresAt": now + SIGNUP_VERIFIED_TTL_SECONDS,
@@ -817,7 +827,8 @@ def delete_account(user=Depends(verify_firebase_user)):
     if username:
         rtdb.reference(f"usernames/{rtdb_safe_key(username)}").delete()
     rtdb.reference(f"users/{user_node(uid)}").delete()
-    rtdb.reference(f"signup_verified/{user_node(uid)}").delete()
+    # The account exists now, so nothing about the signup is needed any more.
+    rtdb.reference(f"pending/{user_node(uid)}").delete()
     for path in (push_path(uid, "fcm"), push_path(uid, "web"), push_path(uid, "last")):
         try:
             rtdb.reference(path).delete()
