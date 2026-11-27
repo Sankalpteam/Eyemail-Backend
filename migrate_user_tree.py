@@ -104,6 +104,12 @@ def main() -> None:
             put(f"pending/{uid_key}/verified", value)
             drop(f"signup_verified/{uid_key}")
 
+    # 2c. the OTP bridge ceiling is global, but not a branch of its own
+    internal = rtdb.reference("limits/internal").get()
+    if internal is not None:
+        put("system/limits/internal", internal)
+        drop("limits/internal")
+
     # 3. domains: the record moves into the owner, the top level keeps the owner only
     domains = rtdb.reference("domains").get() or {}
     if isinstance(domains, dict):
