@@ -1493,7 +1493,7 @@ def internal_send_mail(payload: InternalSendMailRequest, _=Depends(verify_intern
     snippet = re.sub(r"\s+", " ", body)[:120]
 
     # A runaway caller on your side must not be able to flood a mailbox.
-    take_slot("limits/internal", max_count=120, window_seconds=60)
+    take_slot("system/limits/internal", max_count=120, window_seconds=60)
 
     if to_email.endswith(f"@{DOMAIN_NAME}"):
         username = rtdb_safe_key(to_email.split("@")[0])
