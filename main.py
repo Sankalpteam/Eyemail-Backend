@@ -178,6 +178,11 @@ def pending_path(uid: str, tail: str = "") -> str:
     return f"pending/{user_node(uid)}" + (f"/{tail}" if tail else "")
 
 
+def under_user(uid: str, tail: str) -> str:
+    """Any record that belongs to a person lives under that person, in one tree."""
+    return f"users/{user_node(uid)}/{tail}"
+
+
 def push_path(uid: str, tail: str = "") -> str:
     """Everything about notifications for one person lives under their own record."""
     return f"users/{user_node(uid)}/push" + (f"/{tail}" if tail else "")
@@ -662,7 +667,7 @@ def send_login_otp(user=Depends(verify_firebase_user)):
     expires_at = int(time.time()) + OTP_EXPIRY_SECONDS
 
     # Save OTP in Realtime Database
-    rtdb.reference(f"login_otps/{uid}").set({
+    rtdb.reference(under_user(uid, "otp/login")).set({
         "otp": otp_code,
         "expiresAt": expires_at,
         "attempts": 0
@@ -688,7 +693,7 @@ def send_login_otp(user=Depends(verify_firebase_user)):
 def verify_login_otp(payload: VerifyLoginOtpRequest, user=Depends(verify_firebase_user)):
     uid = user["uid"]
     entered_otp = payload.otp.strip()
-    otp_ref = rtdb.reference(f"login_otps/{uid}")
+    otp_ref = rtdb.reference(under_user(uid, "otp/login"))
     record = otp_ref.get()
 
     if not record:
@@ -731,7 +736,7 @@ def send_recovery_otp(payload: RecoveryEmailRequest, user=Depends(verify_firebas
 
     now = int(time.time())
     code = f"{secrets.randbelow(900000) + 100000}"
-    rtdb.reference(f"recovery_otps/{user_node(uid)}").set({
+    rtdb.reference(under_user(uid, "otp/recovery")).set({
         "otp": code, "recoveryEmail": new_email,
         "expiresAt": now + SIGNUP_OTP_EXPIRY_SECONDS, "attempts": 0,
     })
@@ -752,7 +757,7 @@ def send_recovery_otp(payload: RecoveryEmailRequest, user=Depends(verify_firebas
 @app.post("/api/auth/verify-recovery-otp")
 def verify_recovery_otp(payload: OtpOnlyRequest, user=Depends(verify_firebase_user)):
     uid = user["uid"]
-    ref = rtdb.reference(f"recovery_otps/{user_node(uid)}")
+    ref = rtdb.reference(under_user(uid, "otp/recovery"))
     record = ref.get() or {}
     if not record:
         raise HTTPException(status_code=400, detail="Ask for a code first.")
